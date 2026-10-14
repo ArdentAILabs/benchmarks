@@ -7,4 +7,5 @@ evaluated so they can reproduce them.
 |---|---|
 | [`log-anomaly/`](log-anomaly/) | Alerting on logs: a seeded multi-tenant log simulation with labelled cases that must and must not alert |
 
-Copyright (c) 2026 Ardent AI Labs. All rights reserved; see `LICENSE`.
+Copyright 2026 Ardent AI Labs. Licensed under the Apache License, Version 2.0;
+see `LICENSE`.

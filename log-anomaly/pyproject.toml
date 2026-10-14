@@ -3,6 +3,7 @@ name = "logsim"
 version = "0.1.0"
 description = "Seeded multi-tenant log simulation with labelled anomalies, for benchmarking alerting systems"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = ["numpy>=2.1", "tzdata>=2025.2"]
 
