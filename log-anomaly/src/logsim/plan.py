@@ -1,7 +1,8 @@
 """Everything a run does beyond steady traffic, decided before any record exists.
 
-The plan holds the natural episodes (bursts, maintenance windows, exports), the
-injected scenarios, and the ground truth labelling both. The record generator
+The plan holds the natural episodes (bursts, maintenance windows, exports,
+daily batches, retry echoes, deploys), the injected scenarios, and the ground
+truth labelling both. The record generator
 and the truth file read this one plan, so a labelled window and the records
 inside it cannot disagree.
 
@@ -22,7 +23,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from logsim.config import Config, MessageTemplate, Range
+from logsim.kinds import SIGNALS
 from logsim.repro import Stream, rng, zone
+from logsim.traffic import profile
 from logsim.world import Key, Org, World
 
 NS = 10**9
@@ -32,6 +35,18 @@ DAY = 24 * HOUR
 
 # Draws per scenario before the schedule is declared unplaceable.
 _ATTEMPTS_PER_SCENARIO = 1000
+# A provider outage hitting one org is an unplanned_outage; this kind is about
+# many orgs failing at once.
+_PROVIDER_OUTAGE_MIN_ORGS = 2
+# An echo has ended once its expected retries per second fall below this.
+_ECHO_DONE_INTENSITY = 0.01
+_ECHO_MAX_SECONDS = 3600
+# How far an alert case keeps from a natural quiet case it shares a signal
+# with. Wider than the scorer's default deadline, so a late page on one cannot
+# land on the other.
+_QUIET_MARGIN = 30 * MINUTE
+SERVER_ERROR = 500
+OVERLOADED = 503
 
 
 class PlanError(ValueError):
@@ -75,6 +90,66 @@ class NovelError:
 
 
 @dataclass(frozen=True)
+class ErrorSpan:
+    """A key's requests fail with `status` at `share` over [start, end)."""
+
+    key: int
+    start: int
+    end: int
+    share: float
+    status: int
+
+
+@dataclass(frozen=True)
+class Surge:
+    """A key's request rate is multiplied by `multiplier` over [start, end)."""
+
+    key: int
+    start: int
+    end: int
+    multiplier: float
+
+
+@dataclass(frozen=True)
+class Ramp:
+    """A multiplier rising linearly from 1 at `start` to `factor` at `end`. A
+    ramp that holds stays at `factor` afterwards; one that does not drops back
+    to 1, as a leaking process does when it restarts."""
+
+    org: int
+    start: int
+    end: int
+    factor: float
+    holds: bool
+
+
+@dataclass(frozen=True)
+class Cascade:
+    """Retries one key's clients send after a dependency fails at `start`.
+    Retries fail before `overload_end` and succeed after."""
+
+    key: int
+    start: int
+    overload_end: int
+    attempts: tuple[int, ...]  # retries sent in each second from start
+
+
+@dataclass(frozen=True)
+class Deploy:
+    time: int
+    release: str
+
+
+@dataclass(frozen=True)
+class RenameAt:
+    """From `time` on, background template `template` is logged as `to`."""
+
+    time: int
+    template: int
+    to: MessageTemplate
+
+
+@dataclass(frozen=True)
 class Activation:
     start: int  # no records for the org before this
     ramp_end: int  # traffic grows linearly from zero until this
@@ -105,6 +180,13 @@ class Plan:
     exports: tuple[Export, ...]
     novel_errors: tuple[NovelError, ...]
     activations: dict[int, Activation]
+    surges: dict[int, tuple[Surge, ...]]  # by key
+    error_spans: dict[int, tuple[ErrorSpan, ...]]  # by key
+    rate_ramps: dict[int, tuple[Ramp, ...]]  # by org
+    latency_ramps: dict[int, tuple[Ramp, ...]]  # by org
+    cascades: tuple[Cascade, ...]
+    deploys: tuple[Deploy, ...]
+    renames: tuple[RenameAt, ...]
     truth: tuple[Truth, ...]
 
     @property
@@ -133,11 +215,23 @@ class _Window:
 
 
 @dataclass
+class _Echo:
+    key: int
+    start: int
+    overload_end: int
+    attempts: tuple[int, ...]
+
+    @property
+    def end(self) -> int:
+        return max(self.overload_end, self.start + len(self.attempts) * NS)
+
+
+@dataclass
 class _Pending:
     kind: str
     pair: str
     expect: str
-    org: int
+    org: int | None  # None for fleet-wide cases
     key: int | None
     start: int
     end: int
@@ -166,7 +260,19 @@ class _Builder:
         self.exports: list[Export] = []
         self.novel_errors: list[NovelError] = []
         self.activations: dict[int, Activation] = {}
+        self.dedicated: set[int] = set()  # orgs that take part in one scenario and no other
+        self.surges: list[Surge] = []
+        self.error_spans: dict[int, list[ErrorSpan]] = defaultdict(list)
+        self.rate_ramps: dict[int, list[Ramp]] = defaultdict(list)
+        self.latency_ramps: dict[int, list[Ramp]] = defaultdict(list)
+        self.echoes: list[_Echo] = []
+        self.cascades: list[Cascade] = []
+        self.natural_deploys: list[int] = []
+        self.fix_deploys: list[int] = []
+        self.deploys_used: set[int] = set()  # natural deploys a scenario has claimed
+        self.renames: list[RenameAt] = []
         self.injected: list[_Pending] = []
+        self.quiet: list[tuple[str, int | None, int, int, int]] = []  # natural (kind, key, org, start, end)
         self.occupied: dict[int, list[tuple[int, int]]] = defaultdict(list)
 
     # -- natural episodes ------------------------------------------------
@@ -245,19 +351,145 @@ class _Builder:
         export_id = f"exp_{int(draw.integers(1 << 48)):012x}"
         return Export(key.index, export_id, tuple(zip(times, sizes, strict=True)))
 
+    def _batches(self) -> None:
+        b = self.cfg.batches
+        for key in self.world.keys:
+            if key.batch_minute is None:
+                continue
+            tz = zone(self.world.orgs[key.org].timezone)
+            # The world drew batch_minute from (BATCHES, key); the trailing 0
+            # keeps these draws on a stream of their own.
+            draw = rng(self.seed, Stream.BATCHES, key.index, 0)
+            for day in _local_dates(tz, self.start, self.end):
+                jitter = draw.uniform(-b.jitter_minutes, b.jitter_minutes)
+                minutes = draw.uniform(b.duration_minutes.low, b.duration_minutes.high)
+                multiplier = float(draw.uniform(b.multiplier.low, b.multiplier.high))
+                begin = _wall(day, key.batch_minute * 60, tz) + int(jitter * MINUTE)
+                end = begin + int(minutes * MINUTE)
+                if end > self.start and begin < self.end:
+                    self.surges.append(Surge(key.index, begin, end, multiplier))
+
+    def _retry_keys(self) -> list[Key]:
+        return [k for k in self.world.keys if k.rate * self.scale >= self.cfg.retries.min_rate_per_second]
+
+    def _echoes(self) -> None:
+        r = self.cfg.retries
+        days = (self.end - self.start) / DAY
+        for key in self._retry_keys():
+            draw = rng(self.seed, Stream.RETRIES, key.index)
+            count = int(draw.poisson(r.echoes_per_key_per_day * days))
+            for begin in np.sort(draw.integers(self.start, self.end, count)).tolist():
+                blip = int(draw.uniform(r.blip_seconds.low, r.blip_seconds.high))
+                branching = float(draw.uniform(r.echo_branching.low, r.echo_branching.high))
+                attempts = self._cascade(draw, key, begin, blip, branching, r.echo_delay_seconds, storm=False)
+                self.echoes.append(_Echo(key.index, begin, begin + blip * NS, attempts))
+
+    def _cascade(
+        self,
+        draw: np.random.Generator,
+        key: Key,
+        begin: int,
+        overload: int,
+        branching: float,
+        delay: float,
+        storm: bool,
+    ) -> tuple[int, ...]:
+        """Retries per second from `begin`, as a discrete self-exciting process.
+
+        Every failed attempt spawns `branching` retries on average, spread over
+        the following seconds with an exponential delay of mean `delay`.
+        Attempts fail while the dependency is overloaded, the first `overload`
+        seconds, and succeed after, spawning nothing. The admission limit caps
+        attempts per second. A storm's clients stop when the overload ends
+        (the circuit breaker opens); an echo's retries trail off on their own.
+        """
+        cap = self.cfg.retries.storm_max_rate_per_second * self.scale
+        decay = math.exp(-1.0 / delay)
+        gain = branching * (1.0 - decay)
+        first = begin // NS
+        tz = zone(self.world.orgs[key.org].timezone)
+        # The key's own requests failing during the overload seed the cascade.
+        # These are draws from the process the generator emits, not the same
+        # draws; nothing outside the plan can tell the two apart.
+        originals = key.rate * self.scale * profile(np.arange(first, first + overload), tz, self.cfg.traffic)
+        intensity = 0.0
+        attempts: list[int] = []
+        for second in range(overload if storm else overload + _ECHO_MAX_SECONDS):
+            sent = int(draw.poisson(min(intensity, cap)))
+            attempts.append(sent)
+            failed = sent + int(draw.poisson(originals[second])) if second < overload else 0
+            intensity = intensity * decay + gain * failed
+            if not storm and second >= overload and intensity < _ECHO_DONE_INTENSITY:
+                break
+        else:
+            if not storm:
+                raise PlanError(f"a retry echo on {key.id} was still running after {_ECHO_MAX_SECONDS} s")
+        while attempts and attempts[-1] == 0:
+            attempts.pop()
+        return tuple(attempts)
+
+    def _deploys(self) -> None:
+        d = self.cfg.deploys
+        tz = zone(d.timezone)
+        draw = rng(self.seed, Stream.DEPLOYS)
+        low, high = int(d.local_hour.low * 3600), max(int(d.local_hour.high * 3600), int(d.local_hour.low * 3600) + 1)
+        for day in _local_dates(tz, self.start, self.end):
+            count = int(draw.poisson(d.per_weekday)) if day.weekday() < 5 else 0
+            for second in sorted(set(draw.integers(low, high, count).tolist())):
+                at = _wall(day, second, tz)
+                if self.start <= at < self.end:
+                    self.natural_deploys.append(at)
+
     # -- scenarios -------------------------------------------------------
 
-    def _onboarding_orgs(self) -> set[int]:
-        return set(self.activations)
-
     def _eligible_keys(self, predicate: Callable[[Key, Org], bool]) -> list[Key]:
-        onboarding = self._onboarding_orgs()
-        return [k for k in self.world.keys if k.org not in onboarding and predicate(k, self.world.orgs[k.org])]
+        return [k for k in self.world.keys if k.org not in self.dedicated and predicate(k, self.world.orgs[k.org])]
+
+    def _eligible_orgs(self) -> list[Org]:
+        return [o for o in self.world.orgs if o.index not in self.dedicated]
 
     def _free(self, org: int, start: int, end: int) -> bool:
         return all(end + self.gap <= s or e + self.gap <= start for s, e in self.occupied[org])
 
-    def _place(self, kind: str, count: int, candidates: int, sample: Callable[[], _Candidate | None]) -> None:
+    def _index_quiet(self) -> None:
+        """Natural quiet cases, for _clashes. Includes ones a later filter drops
+        (before an org arrives, during a silence); avoiding those too only
+        narrows placement."""
+        for b in self.natural_bursts:
+            self.quiet.append(("natural_burst", b.key, self.world.keys[b.key].org, b.start, b.end))
+        for w in self.windows:
+            self.quiet.append(("maintenance_window", None, w.org, w.start, w.end))
+        for e in self.weekly_exports:
+            self.quiet.append(("scheduled_export", e.key, self.world.keys[e.key].org, e.parts[0][0], e.parts[-1][0]))
+        for s in self.surges:
+            self.quiet.append(("batch_surge", s.key, self.world.keys[s.key].org, s.start, s.end))
+        for e in self.echoes:
+            self.quiet.append(("retry_echo", e.key, self.world.keys[e.key].org, e.start, e.end))
+
+    def _clashes(self, kind: str, orgs: tuple[int, ...], key: int | None, start: int, end: int) -> bool:
+        """Would a page on this alert case also land on a natural quiet case,
+        by the scorer's rules, even with the right signal? A case on whole orgs
+        shares pages with everything in them. A key-level case shares them with
+        its key's cases; it would also share them with its org's org-level
+        ones, but the only natural one, a maintenance window, shows `health`,
+        which no key-level kind does."""
+        signals = SIGNALS[kind]
+        low, high = start - _QUIET_MARGIN, end + _QUIET_MARGIN
+        for quiet, k, org, s, e in self.quiet:
+            if e <= low or s >= high or not SIGNALS[quiet] & signals:
+                continue
+            # An overrun replaces the window it starts with; that one is not a neighbour.
+            if kind == "maintenance_overrun" and quiet == "maintenance_window" and s == start:
+                continue
+            if key is not None and k == key:
+                return True
+            if key is None and org in orgs:
+                return True
+        return False
+
+    def _place(
+        self, kind: str, count: int, candidates: int, sample: Callable[[], _Candidate | None], alert: bool = True
+    ) -> None:
         if count and not candidates:
             raise PlanError(f"scenarios.{kind}: no eligible targets in this world; see the README for each kind's rule")
         placed = 0
@@ -267,10 +499,13 @@ class _Builder:
             candidate = sample()
             if candidate is None:
                 continue
-            org, start, end, commit = candidate
-            if start < self.scored_from or end > self.end or not self._free(org, start, end):
+            orgs, key, start, end, commit = candidate
+            if start < self.scored_from or end > self.end or not all(self._free(o, start, end) for o in orgs):
                 continue
-            self.occupied[org].append((start, end))
+            if alert and self._clashes(kind, orgs, key, start, end):
+                continue
+            for org in orgs:
+                self.occupied[org].append((start, end))
             commit()
             placed += 1
         if placed < count:
@@ -307,13 +542,15 @@ class _Builder:
 
             def commit() -> None:
                 self.activations[org.index] = Activation(begin, begin + ramp)
+                self.dedicated.add(org.index)
                 self.injected.append(
                     _Pending("onboarding", "onboarding", "quiet", org.index, None, begin, begin + ramp)
                 )
 
-            return org.index, begin, begin + ramp, commit
+            return (org.index,), None, begin, begin + ramp, commit
 
-        self._place("onboarding", sc.onboarding, len(newcomers), onboarding)
+        self._place("onboarding", sc.onboarding, len(newcomers), onboarding, alert=False)
+        self._organic_growth()
 
         def mixed_org(k: Key, o: Org) -> bool:
             return any(self.world.keys[j].archetype == "bursty" for j in o.keys)
@@ -336,12 +573,11 @@ class _Builder:
                     )
                 )
 
-            return key.org, begin, begin + duration, commit
+            return (key.org,), key.index, begin, begin + duration, commit
 
         self._place("burst_on_steady_key", sc.burst_on_steady_key, len(steady), burst_on_steady_key)
 
-        onboarding_orgs = self._onboarding_orgs()
-        unmaintained = [o for o in self.world.orgs if o.provider.maintenance is None and o.index not in onboarding_orgs]
+        unmaintained = [o for o in self._eligible_orgs() if o.provider.maintenance is None]
         outage_orgs: set[int] = set()
 
         def unplanned_outage() -> _Candidate | None:
@@ -360,14 +596,12 @@ class _Builder:
                     _Pending("unplanned_outage", "outage", "alert", org.index, None, begin, end, detail)
                 )
 
-            return org.index, begin, end, commit
+            return (org.index,), None, begin, end, commit
 
         self._place("unplanned_outage", sc.unplanned_outage, len(unmaintained), unplanned_outage)
 
         windows = [
-            w
-            for w in self.windows
-            if w.start >= self.scored_from and w.end <= self.end and w.org not in onboarding_orgs
+            w for w in self.windows if w.start >= self.scored_from and w.end <= self.end and w.org not in self.dedicated
         ]
         overrun_orgs: set[int] = set()
 
@@ -387,7 +621,7 @@ class _Builder:
                 )
                 self.outages[window.org].append(Outage(window.org, window.start, end))
 
-            return window.org, window.start, end, commit
+            return (window.org,), None, window.start, end, commit
 
         self._place("maintenance_overrun", sc.maintenance_overrun, len(windows), maintenance_overrun)
 
@@ -410,7 +644,7 @@ class _Builder:
                     _Pending("novel_error", "error", "alert", key.org, key.index, begin, begin + window_ns, detail)
                 )
 
-            return key.org, begin, begin + window_ns, commit
+            return (key.org,), key.index, begin, begin + window_ns, commit
 
         self._place("novel_error", sc.novel_error, len(anyone), novel_error)
 
@@ -435,7 +669,7 @@ class _Builder:
                     _Pending("unscheduled_bulk_export", "egress", "alert", key.org, key.index, begin, end, detail)
                 )
 
-            return key.org, begin, end, commit
+            return (key.org,), key.index, begin, end, commit
 
         self._place("unscheduled_bulk_export", sc.unscheduled_bulk_export, len(unscheduled), unscheduled_bulk_export)
 
@@ -461,9 +695,224 @@ class _Builder:
                     _Pending("key_silence", "silence", "alert", key.org, key.index, begin, begin + silence_ns, detail)
                 )
 
-            return key.org, begin, begin + silence_ns, commit
+            return (key.org,), key.index, begin, begin + silence_ns, commit
 
         self._place("key_silence", sc.key_silence, len(loud), key_silence)
+
+        self._retry_storms()
+        self._error_rate_shifts()
+        self._provider_outages()
+        self._bad_deploys()
+        self._renamed_errors()
+        self._latency_leaks()
+
+    # Each kind below draws from a stream of its own, so adding or resizing one
+    # leaves the others' draws alone. Placement still depends on order: a kind
+    # avoids the slots earlier kinds took.
+
+    def _organic_growth(self) -> None:
+        sc = self.cfg.scenarios
+        draw = rng(self.seed, Stream.SCENARIOS, 1)
+        orgs = self._eligible_orgs()
+
+        def organic_growth() -> _Candidate | None:
+            org = orgs[int(draw.integers(len(orgs)))]
+            days = draw.uniform(sc.growth_days.low, sc.growth_days.high)
+            factor = float(draw.uniform(sc.growth_factor.low, sc.growth_factor.high))
+            if org.index in self.dedicated:
+                return None
+            begin = int(draw.integers(self.scored_from, self.end))
+            end = begin + int(days * DAY)
+
+            def commit() -> None:
+                self.dedicated.add(org.index)
+                self.rate_ramps[org.index].append(Ramp(org.index, begin, end, factor, holds=True))
+                detail = {"factor": factor}
+                self.injected.append(_Pending("organic_growth", "drift", "quiet", org.index, None, begin, end, detail))
+
+            # The org's rate stays raised to the end of the run; being dedicated
+            # keeps every later scenario out of it.
+            return (org.index,), None, begin, end, commit
+
+        self._place("organic_growth", sc.organic_growth, len(orgs), organic_growth, alert=False)
+
+    def _retry_storms(self) -> None:
+        sc, r = self.cfg.scenarios, self.cfg.retries
+        draw = rng(self.seed, Stream.SCENARIOS, 2)
+        keys = [k for k in self._retry_keys() if k.org not in self.dedicated]
+        cap = r.storm_max_rate_per_second * self.scale
+        used: set[int] = set()
+
+        def retry_storm() -> _Candidate | None:
+            key = _pick(draw, keys, used, lambda k: k.index)
+            minutes = draw.uniform(r.storm_minutes.low, r.storm_minutes.high)
+            branching = float(draw.uniform(r.storm_branching.low, r.storm_branching.high))
+            blip = int(draw.uniform(r.blip_seconds.low, r.blip_seconds.high))
+            begin = int(draw.integers(self.scored_from, self.end))
+            overload = max(int(minutes * 60), blip)
+            end = begin + overload * NS
+            if end > self.end:
+                return None
+            attempts = self._cascade(draw, key, begin, overload, branching, r.storm_delay_seconds, storm=True)
+            # A supercritical cascade can still die out in its first seconds;
+            # that run is an echo, not a storm, so draw again.
+            if max(attempts, default=0) < cap:
+                return None
+
+            def commit() -> None:
+                used.add(key.index)
+                self.cascades.append(Cascade(key.index, begin, end, attempts))
+                self.error_spans[key.index].append(ErrorSpan(key.index, begin, end, 1.0, OVERLOADED))
+                detail = {"branching": branching, "retries": sum(attempts), "blip_seconds": blip}
+                self.injected.append(_Pending("retry_storm", "retry", "alert", key.org, key.index, begin, end, detail))
+
+            return (key.org,), key.index, begin, end, commit
+
+        self._place("retry_storm", sc.retry_storm, len(keys), retry_storm)
+
+    def _error_rate_shifts(self) -> None:
+        sc, b = self.cfg.scenarios, self.cfg.batches
+        draw = rng(self.seed, Stream.SCENARIOS, 3)
+        keys = self._eligible_keys(lambda k, o: k.rate * self.scale >= sc.error_shift_min_rate_per_second)
+        used: set[int] = set()
+
+        def error_rate_shift() -> _Candidate | None:
+            # Same duration and multiplier as a daily batch: a batch multiplies
+            # the volume and the errors with it, a shift only the errors.
+            key = _pick(draw, keys, used, lambda k: k.index)
+            minutes = draw.uniform(b.duration_minutes.low, b.duration_minutes.high)
+            multiplier = float(draw.uniform(b.multiplier.low, b.multiplier.high))
+            begin = int(draw.integers(self.scored_from, self.end))
+            end = begin + int(minutes * MINUTE)
+            share = min(1.0, self.cfg.traffic.server_error_share * multiplier)
+
+            def commit() -> None:
+                used.add(key.index)
+                self.error_spans[key.index].append(ErrorSpan(key.index, begin, end, share, SERVER_ERROR))
+                detail = {"multiplier": multiplier, "server_error_share": share}
+                self.injected.append(
+                    _Pending("error_rate_shift", "error_rate", "alert", key.org, key.index, begin, end, detail)
+                )
+
+            return (key.org,), key.index, begin, end, commit
+
+        self._place("error_rate_shift", sc.error_rate_shift, len(keys), error_rate_shift)
+
+    def _provider_members(self) -> dict[str, list[Org]]:
+        members: dict[str, list[Org]] = defaultdict(list)
+        for org in self._eligible_orgs():
+            members[org.provider.name].append(org)
+        return members
+
+    def _outage_providers(self) -> list[tuple[str, list[Org]]]:
+        # Dedicated orgs stay out of it even on the failing provider, so each
+        # still tests only the one thing it was set aside for.
+        members = self._provider_members()
+        return [(p, members[p]) for p in sorted(members) if len(members[p]) >= _PROVIDER_OUTAGE_MIN_ORGS]
+
+    def _provider_outages(self) -> None:
+        sc = self.cfg.scenarios
+        draw = rng(self.seed, Stream.SCENARIOS, 4)
+        providers = self._outage_providers()
+        used: set[int] = set()
+
+        def provider_outage() -> _Candidate | None:
+            index = _pick(draw, list(range(len(providers))), used, lambda i: i)
+            provider, orgs = providers[index]
+            minutes = draw.uniform(sc.provider_outage_minutes.low, sc.provider_outage_minutes.high)
+            begin = int(draw.integers(self.scored_from, self.end))
+            end = begin + int(minutes * MINUTE)
+
+            def commit() -> None:
+                used.add(index)
+                for org in orgs:
+                    self.outages[org.index].append(Outage(org.index, begin, end))
+                detail = {"provider": provider, "orgs": sorted(o.id for o in orgs)}
+                self.injected.append(_Pending("provider_outage", "outage", "alert", None, None, begin, end, detail))
+
+            return tuple(o.index for o in orgs), None, begin, end, commit
+
+        self._place("provider_outage", sc.provider_outage, len(providers), provider_outage)
+
+    def _scored_deploys(self) -> list[int]:
+        return [t for t in self.natural_deploys if t >= self.scored_from]
+
+    def _bad_deploys(self) -> None:
+        sc = self.cfg.scenarios
+        draw = rng(self.seed, Stream.SCENARIOS, 5)
+        deploys = self._scored_deploys()
+        members = self._provider_members()
+        providers = [(p, members[p]) for p in sorted(members)]
+
+        def bad_deploy() -> _Candidate | None:
+            at = deploys[int(draw.integers(len(deploys)))]
+            provider, orgs = providers[int(draw.integers(len(providers)))]
+            minutes = draw.uniform(sc.bad_deploy_minutes.low, sc.bad_deploy_minutes.high)
+            share = float(draw.uniform(sc.bad_deploy_error_share.low, sc.bad_deploy_error_share.high))
+            if at in self.deploys_used:
+                return None
+            fix = at + int(minutes * MINUTE)
+
+            def commit() -> None:
+                # The fix ships as one more forward deploy. A rollback marker
+                # would name the bad release after the fact, and a detector
+                # paging on it would score a detection it never made.
+                self.deploys_used.add(at)
+                self.fix_deploys.append(fix)
+                for org in orgs:
+                    for key in org.keys:
+                        self.error_spans[key].append(ErrorSpan(key, at, fix, share, SERVER_ERROR))
+                detail = {"provider": provider, "orgs": sorted(o.id for o in orgs), "server_error_share": share}
+                self.injected.append(_Pending("bad_deploy", "deploy", "alert", None, None, at, fix, detail))
+
+            return tuple(o.index for o in orgs), None, at, fix, commit
+
+        self._place("bad_deploy", sc.bad_deploy, len(deploys) and len(providers), bad_deploy)
+
+    def _renamed_errors(self) -> None:
+        sc = self.cfg.scenarios
+        draw = rng(self.seed, Stream.SCENARIOS, 6)
+        deploys = self._scored_deploys()
+        renames = [self.cfg.renames[i] for i in draw.permutation(len(self.cfg.renames)).tolist()]
+
+        def renamed_error() -> _Candidate | None:
+            at = deploys[int(draw.integers(len(deploys)))]
+            if at in self.deploys_used:
+                return None
+
+            def commit() -> None:
+                self.deploys_used.add(at)
+                rename = renames.pop(0)
+                self.renames.append(RenameAt(at, rename.template, rename.to))
+
+            # Fleet-wide and harmless: it occupies no org. Its truth comes from
+            # the emitted lines, in logsim.labels.
+            return (), None, at, at + 1, commit
+
+        self._place("renamed_error", sc.renamed_error, len(deploys), renamed_error, alert=False)
+
+    def _latency_leaks(self) -> None:
+        sc = self.cfg.scenarios
+        draw = rng(self.seed, Stream.SCENARIOS, 7)
+        orgs = self._eligible_orgs()
+        used: set[int] = set()
+
+        def latency_leak() -> _Candidate | None:
+            org = _pick(draw, orgs, used, lambda o: o.index)
+            hours = draw.uniform(sc.leak_hours.low, sc.leak_hours.high)
+            factor = float(draw.uniform(sc.leak_factor.low, sc.leak_factor.high))
+            begin = int(draw.integers(self.scored_from, self.end))
+            end = begin + int(hours * HOUR)
+
+            def commit() -> None:
+                used.add(org.index)
+                self.latency_ramps[org.index].append(Ramp(org.index, begin, end, factor, holds=False))
+                detail = {"factor": factor}
+                self.injected.append(_Pending("latency_leak", "drift", "alert", org.index, None, begin, end, detail))
+
+            return (org.index,), None, begin, end, commit
+
+        self._place("latency_leak", sc.latency_leak, len(orgs), latency_leak)
 
     # -- assembly --------------------------------------------------------
 
@@ -471,6 +920,10 @@ class _Builder:
         self._natural_bursts()
         self._maintenance_windows()
         self._exports()
+        self._batches()
+        self._echoes()
+        self._deploys()
+        self._index_quiet()
         self._scenarios()
 
         active = self._is_active
@@ -506,8 +959,36 @@ class _Builder:
             if active(self.world.keys[e.key].org, e.parts[0][0])
             and not any(s.start <= e.parts[-1][0] and e.parts[0][0] < s.end for s in self.silences.get(e.key, ()))
         )
+        surges: dict[int, list[Surge]] = defaultdict(list)
+        for surge in self.surges:
+            org = self.world.keys[surge.key].org
+            if not active(org, surge.start):
+                continue
+            surges[surge.key].append(surge)
+            detail = {"multiplier": surge.multiplier}
+            pending.append(
+                _Pending("batch_surge", "error_rate", "quiet", org, surge.key, surge.start, surge.end, detail)
+            )
+        for echo in self.echoes:
+            org = self.world.keys[echo.key].org
+            # No echo overlaps a silence: _clashes keeps key_silence clear of them.
+            if not active(org, echo.start):
+                continue
+            self.cascades.append(Cascade(echo.key, echo.start, echo.overload_end, echo.attempts))
+            self.error_spans[echo.key].append(ErrorSpan(echo.key, echo.start, echo.overload_end, 1.0, OVERLOADED))
+            detail = {"retries": sum(echo.attempts)}
+            pending.append(_Pending("retry_echo", "retry", "quiet", org, echo.key, echo.start, echo.end, detail))
 
-        pending.sort(key=lambda p: (p.start, p.kind, p.org, -1 if p.key is None else p.key))
+        times = sorted(self.natural_deploys + self.fix_deploys)
+        if len(set(times)) != len(times):
+            raise PlanError("two deploys landed on the same nanosecond; choose another seed")
+        deploys = tuple(Deploy(t, f"r{i:04d}") for i, t in enumerate(times, start=1))
+        release = {d.time: d.release for d in deploys}
+        for p in pending:
+            if p.kind == "bad_deploy":
+                p.detail = {"release": release[p.start], "fix_release": release[p.end], **p.detail}
+
+        pending.sort(key=lambda p: (p.start, p.kind, -1 if p.org is None else p.org, -1 if p.key is None else p.key))
         truth = tuple(
             Truth(
                 id=f"t{i:05d}",
@@ -533,6 +1014,13 @@ class _Builder:
             exports=tuple(sorted(self.exports, key=lambda e: (e.parts[0][0], e.id))),
             novel_errors=tuple(sorted(self.novel_errors, key=lambda n: n.time)),
             activations=dict(self.activations),
+            surges={k: tuple(sorted(v, key=lambda s: s.start)) for k, v in surges.items()},
+            error_spans={k: tuple(sorted(v, key=lambda s: s.start)) for k, v in self.error_spans.items()},
+            rate_ramps={k: tuple(v) for k, v in self.rate_ramps.items()},
+            latency_ramps={k: tuple(v) for k, v in self.latency_ramps.items()},
+            cascades=tuple(sorted(self.cascades, key=lambda c: (c.start, c.key))),
+            deploys=deploys,
+            renames=tuple(sorted(self.renames, key=lambda r: r.time)),
             truth=truth,
         )
 
@@ -545,7 +1033,7 @@ def _active(activations: dict[int, Activation], org: int, at: int) -> bool:
     return activation is None or at >= activation.start
 
 
-_Candidate = tuple[int, int, int, Callable[[], None]]  # (org, start, end, commit)
+_Candidate = tuple[tuple[int, ...], int | None, int, int, Callable[[], None]]  # (orgs, key, start, end, commit)
 
 
 def _pick[T](draw: np.random.Generator, items: list[T], used: set[int], ident: Callable[[T], int]) -> T:

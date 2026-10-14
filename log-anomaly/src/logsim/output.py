@@ -66,6 +66,7 @@ def world_document(world: World) -> dict[str, object]:
                         "archetype": world.keys[k].archetype,
                         "rate_per_second": world.keys[k].rate,
                         "gamma_shape": world.keys[k].gamma_shape,
+                        "daily_batch_minute": world.keys[k].batch_minute,
                         "weekly_export": (
                             None
                             if world.keys[k].weekly_export is None

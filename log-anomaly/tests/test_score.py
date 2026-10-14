@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from logsim.kinds import SIGNALS
 from logsim.output import iso
 from logsim.plan import MINUTE
 from logsim.score import Case, Page, Run, ScoreError, load_pages, load_run, parse_time, score, wilson
@@ -13,10 +14,14 @@ from logsim.score import Case, Page, Run, ScoreError, load_pages, load_run, pars
 DEADLINE = 15.0
 
 
-def _page(case: Case, at: int, run: Run) -> Page:
-    if case.key is not None:
-        return Page(0, at, run.key_org[case.key], case.key)
-    return Page(0, at, case.org, None)
+def _page(case: Case, at: int, run: Run, signal: bool = True) -> Page:
+    """A page that is right about `case`: its entity (a member key for cases
+    spanning several orgs) and, when `signal`, one signal it shows."""
+    shows = min(SIGNALS[case.kind]) if signal else None
+    key = case.key if case.key is not None else min(case.member_keys, default=None)
+    if key is not None:
+        return Page(0, at, run.key_org[key], key, shows)
+    return Page(0, at, case.org, None, shows)
 
 
 def _countable(run: Run) -> tuple[list[Case], list[Case]]:
@@ -44,13 +49,23 @@ def test_an_oracle_scores_perfectly(run_dir: Path) -> None:
     assert report["recall"]["rate"] == 1.0
     assert report["pages"] == {"true": len(must)}
     assert report["precision"] == 1.0
+    assert report["matched_on"] == "entity, time and signal"
+    assert {c.kind for c in must} >= {
+        "retry_storm",
+        "error_rate_shift",
+        "provider_outage",
+        "bad_deploy",
+        "latency_leak",
+    }
 
 
 def test_repeat_pages_are_duplicates_not_false(run_dir: Path) -> None:
     run = load_run(run_dir)
     must, _ = _countable(run)
     pages = [_page(c, c.start + i * MINUTE, run) for c in must for i in range(2)]
-    assert score(run, pages, DEADLINE).as_dict()["pages"] == {"duplicate": len(must), "true": len(must)}
+    report = score(run, pages, DEADLINE).as_dict()
+    assert report["pages"] == {"duplicate": len(must), "true": len(must)}
+    assert set(report["pages_per_detected_case"].values()) == {2.0}
 
 
 def test_silence_detects_nothing_and_pages_nothing(run_dir: Path) -> None:
@@ -60,10 +75,11 @@ def test_silence_detects_nothing_and_pages_nothing(run_dir: Path) -> None:
 
 
 def test_paging_on_every_quiet_case_is_all_false(run_dir: Path) -> None:
+    """With signals, a page about a quiet case never lands on an alert case: the
+    plan keeps the two apart wherever they share an entity and a signal."""
     run = load_run(run_dir)
     _, quiet = _countable(run)
-    pages = [_page(c, c.start, run) for c in quiet if c.kind != "chance_error_clump"]
-    pages += [Page(0, c.start, None, None) for c in quiet if c.kind == "chance_error_clump"]
+    pages = [_page(c, c.start, run) for c in quiet]
     report = score(run, pages, DEADLINE)
     assert report.pages == {"false": len(pages)}
     assert report.paged_quiet == {c.id for c in quiet}
@@ -169,5 +185,53 @@ def test_an_unfinished_stream_needs_consent(run_dir: Path, tmp_path: Path) -> No
 def test_warm_up_pages_are_not_scored(run_dir: Path) -> None:
     run = load_run(run_dir)
     warm = next(c for c in run.cases if not c.scored and c.kind == "maintenance_window")
-    report = score(run, [_page(warm, warm.start, run), Page(0, run.scored_from - 1, None, None)], DEADLINE)
+    report = score(run, [_page(warm, warm.start, run), Page(0, run.scored_from - 1, None, None, "health")], DEADLINE)
     assert report.pages == {"excluded": 2}
+
+
+def test_the_wrong_signal_does_not_detect(run_dir: Path) -> None:
+    run = load_run(run_dir)
+    must, _ = _countable(run)
+    case = next(c for c in must if c.kind == "latency_leak")
+    right = _page(case, case.start, run)
+    wrong = Page(0, case.start, right.org, right.key, "requests")
+    assert case.id in score(run, [right], DEADLINE).detected
+    assert case.id not in score(run, [wrong], DEADLINE).detected
+
+
+def test_without_signals_a_long_case_takes_any_page_on_its_org(run_dir: Path) -> None:
+    """The reason signals exist: by entity and time alone, a page about anything
+    in a leaking org counts as finding the leak."""
+    run = load_run(run_dir)
+    must, _ = _countable(run)
+    case = next(c for c in must if c.kind == "latency_leak")
+    report = score(run, [Page(0, case.start, case.org, None)], DEADLINE)
+    assert case.id in report.detected and report.as_dict()["matched_on"] == "entity and time"
+
+
+def test_signals_are_all_or_nothing(run_dir: Path, tmp_path: Path) -> None:
+    run = load_run(run_dir)
+    must, _ = _countable(run)
+    with pytest.raises(ScoreError, match="all of them or none"):
+        score(run, [_page(must[0], must[0].start, run), _page(must[1], must[1].start, run, signal=False)], DEADLINE)
+    path = tmp_path / "pages.jsonl"
+    path.write_text(json.dumps({"time": "2026-10-25T00:00:00Z", "signal": "vibes"}) + "\n")
+    with pytest.raises(ScoreError, match="unknown signal"):
+        load_pages(path, run)
+
+
+def test_a_case_spanning_orgs_must_list_them(run_dir: Path, tmp_path: Path) -> None:
+    copy = tmp_path / "run"
+    shutil.copytree(run_dir, copy)
+    lines = (copy / "truth.jsonl").read_text().splitlines()
+    for i, line in enumerate(lines):
+        doc = json.loads(line)
+        if doc["kind"] == "provider_outage":
+            del doc["detail"]["orgs"]
+            lines[i] = json.dumps(doc)
+            break
+    else:
+        raise AssertionError("the small run has no provider_outage")
+    (copy / "truth.jsonl").write_text("\n".join(lines) + "\n")
+    with pytest.raises(ScoreError, match="lists no member orgs"):
+        load_run(copy)

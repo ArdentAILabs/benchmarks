@@ -25,6 +25,7 @@ class Key:
     rate: float  # requests/s on an average weekday, before rate_scale
     gamma_shape: float | None
     weekly_export: WeeklyExport | None
+    batch_minute: int | None  # org-local minute of day a daily batch job starts
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,14 @@ def build_world(cfg: Config, seed: int) -> World:
         org_keys = []
         for archetype in archetypes:
             spec = cfg.archetypes[archetype]
+            index = len(keys)
+            # Its own stream, so adding daily batches left every other draw of
+            # the world where it was.
+            batch = rng(seed, Stream.BATCHES, index)
+            batch_minute = None
+            if batch.random() < cfg.batches.share:
+                low, high = int(cfg.batches.local_hour.low * 60), int(cfg.batches.local_hour.high * 60)
+                batch_minute = int(batch.integers(low, max(high, low + 1)))
             weekly = None
             if draw.random() < cfg.exports.scheduled_share:
                 hours = cfg.exports.scheduled_local_hour
@@ -78,7 +87,7 @@ def build_world(cfg: Config, seed: int) -> World:
                     minute_of_day=int(draw.integers(int(hours.low * 60), int(hours.high * 60))),
                 )
             key = Key(
-                index=len(keys),
+                index=index,
                 id=_unique_id(draw, "key", used_ids),
                 org=org_index,
                 archetype=archetype,
@@ -89,6 +98,7 @@ def build_world(cfg: Config, seed: int) -> World:
                     else None
                 ),
                 weekly_export=weekly,
+                batch_minute=batch_minute,
             )
             keys.append(key)
             org_keys.append(key.index)

@@ -23,16 +23,28 @@ the entity's own history, or the metadata on its records, says which is which.
 | a maintenance window | it opens an hour later in UTC because the provider's zone left summer time | it runs 30–60 min instead of 5–10 (`maintenance_overrun`) |
 | a key exports ~20 GB at night | the key does this every week (`scheduled_export`) | the key never has (`unscheduled_bulk_export`) |
 | a handful of errors in ten minutes | a known error that clumps by chance (`chance_error_clump`) | an error message never seen before (`novel_error`) |
+| an error message never seen before | a deploy renamed a known message and it arrives at the old rate (`renamed_error`) | it is new, and nothing went away (`novel_error`) |
+| a dependency fails a key's requests with 503 for 20–60 s, and its clients retry | the clients back off and the retries die out (`retry_echo`) | each failure spawns more than one retry, until the admission limit and a circuit breaker (`retry_storm`) |
+| a key's 5xx responses rise 4–8x for 30–90 min | its daily batch job multiplied its traffic, errors with it (`batch_surge`) | the share of requests failing rose and traffic did not (`error_rate_shift`), or a deploy broke one provider's orgs until a fix shipped (`bad_deploy`) |
+| an org's numbers climb over days | its traffic grows and stays grown (`organic_growth`) | its latency climbs until the leaking process restarts (`latency_leak`) |
 
-Chance clumps are found after the fact: every run of at least
-`novel_error_count` lines of one background message within
-`novel_error_window_minutes` becomes one quiet case, overlapping runs merged.
-They are fleet-wide, so they name their keys and orgs in `detail` instead of
-one entity.
+Chance clumps and renamed errors are found after the fact, from the emitted
+lines. Every run of at least `novel_error_count` lines of one background
+message within `novel_error_window_minutes` becomes one chance clump,
+overlapping runs merged. A renamed error runs from its deploy to the new
+text's `novel_error_count`-th line, when it stops being new. Both are
+fleet-wide, so they name their keys and orgs in `detail` instead of one entity.
 
-Two cases stand alone: `key_silence` (a busy key goes quiet for two weekday
-hours, must alert) and `onboarding` (a new org appears and ramps up over days,
-must stay quiet).
+Three cases stand alone: `key_silence` (a busy key goes quiet for two weekday
+hours, must alert), `provider_outage` (every org on one provider fails its
+health checks at once, must alert, and should page once rather than once per
+org) and `onboarding` (a new org appears and ramps up over days, must stay
+quiet).
+
+The plan keeps every must-alert case at least 30 minutes from any natural
+quiet case that shares its signal and its key (or, for a case on whole orgs,
+anything in them), so one page cannot be right about both.
+`test_alert_cases_keep_clear_of_quiet_look_alikes` checks it.
 
 ## The world
 
@@ -46,6 +58,10 @@ A config describes a distribution over worlds; the seed draws one.
 | providers | each org connects one database; some providers take it down for a few minutes daily, scheduled in local time or in UTC |
 | health checks | every org's source is probed every 30 s; failures read the same whether planned or not |
 | exports | every key exports small amounts now and then; some keys export ~20 GB weekly |
+| server errors | 0.5% of requests fail with 500 |
+| daily batches | some keys run a batch job at about the same local time every day, multiplying their traffic for 30–90 minutes |
+| retries | now and then a dependency fails a busy key's requests for 20–60 s and its clients retry, as a self-exciting process simulated per second; these echoes die out |
+| deploys | the fleet ships about three releases a weekday in US Pacific working hours, each logged by the `deployer` service |
 | background errors | each error template arrives as a fleet-wide Poisson process |
 
 Fixed orgs (`[[orgs.fixed]]`) mix key types, so an org's total hides what any
@@ -67,7 +83,18 @@ that cannot be placed fails with the knob to change; it is never thinned.
 | `novel_error` | alert | any key; each `errors.novel` template is used once |
 | `unscheduled_bulk_export` | alert | keys without a weekly export |
 | `key_silence` | alert | non-bursty keys at or above `silence_min_rate_per_second` |
+| `retry_storm` | alert | keys at or above `retries.min_rate_per_second`; a cascade that dies out in its first seconds is drawn again |
+| `error_rate_shift` | alert | keys at or above `error_shift_min_rate_per_second`; duration and multiplier come from `[batches]` |
+| `provider_outage` | alert | providers with at least two eligible orgs; every eligible org on the provider fails |
+| `bad_deploy` | alert | a scored natural deploy; every eligible org on one provider fails at `bad_deploy_error_share` until a fix deploy |
+| `latency_leak` | alert | any eligible org |
+| `renamed_error` | quiet | a scored natural deploy no other scenario claimed; each `errors.renames` entry is used once |
 | `onboarding` | quiet | randomly drawn orgs, which then take part in no other scenario |
+| `organic_growth` | quiet | any org not onboarding, which then takes part in no other scenario |
+
+"Eligible" orgs exclude the onboarding and organic-growth orgs, provider
+outages and bad deploys included, so each of those tests only the one thing it
+was set aside for.
 
 ## Running
 
@@ -115,14 +142,17 @@ vendor yet.
 | File | Contents |
 |---|---|
 | `logs.jsonl` | one record per line: `time` (RFC 3339, ns), `time_unix_nano`, `severity`, `service`, `body`, `attributes` |
-| `truth.jsonl` | one case per line: `id`, `kind`, `pair`, `expect` (`alert` or `quiet`), `scored`, `org.id`, `api_key.id`, `start`, `end`, `detail`; fleet-wide cases have neither id and list `keys` and `orgs` in `detail` |
+| `truth.jsonl` | one case per line: `id`, `kind`, `pair`, `expect` (`alert` or `quiet`), `scored`, `org.id`, `api_key.id`, `start`, `end`, `detail`; cases spanning several orgs have neither id and list their `orgs` (and, where they come from emitted lines, `keys`) in `detail` |
 | `world.json` | every org and key with its archetype, rate, provider and schedule |
 | `manifest.json` | seed, config digest, run window, package versions; `generate` adds record counts and the log digest |
 | `journal.jsonl` | `stream` only: each start, minute-by-minute progress, and where it stopped |
 
-Records carry `org.id`, `api_key.id` (except health checks) and
-`source.provider`; requests add OpenTelemetry HTTP attributes. Nothing in a
-record says whether it was injected: injected and natural events use the same
+Request, export and error records carry `org.id`, `api_key.id` and
+`source.provider`; requests add OpenTelemetry HTTP attributes and
+`duration_ms`, and retries are requests like any other. Health checks carry
+`org.id` and `source.provider`. Deploys are `deployed release r0042` from
+service `deployer`, carrying only `deploy.release`. Nothing in a record says
+whether it was injected: injected and natural events use the same
 record builders, and `test_injection_leaves_no_structural_trace` checks that a
 run with scenarios produces the same services, severities, attribute keys and
 request and health-check bodies as one without.
@@ -136,7 +166,7 @@ A system under test is scored on the pages that reached a person, one JSON
 object per line:
 
 ```json
-{"time": "2026-10-27T03:41:10Z", "api_key.id": "key_0123456789", "org.id": "org_0123456789"}
+{"time": "2026-10-27T03:41:10Z", "api_key.id": "key_0123456789", "org.id": "org_0123456789", "signal": "errors"}
 ```
 
 `time` is required, RFC 3339 with an offset. Name the key, the org, both, or
@@ -144,15 +174,26 @@ neither, as the page did; other fields are ignored. An id the world does not
 know is an error, never a silent miss. Turning a vendor's incidents or issues
 into this file is the one step outside `logsim`.
 
+`signal` says what the page saw: `requests`, `errors`, `latency`, `health` or
+`exports`. With it, a page matches only cases that show that signal
+(`logsim/kinds.py` lists them). Without it, a page about anything in an org
+counts as finding a two-day latency leak there. Label every page in a file or
+none; a mix is an error, and the report says which rule it used. Compare two
+systems only under the same rule.
+
 Every page is classified once. The rules live in `logsim/score.py`'s module
 docstring; in short:
 
 - A page detects a must-alert case when it names the case's entity and arrives
   between the case's start and 15 minutes (`--deadline-minutes`) after its
   end. Key-level cases need the key; naming only its org is not enough.
-  Org-level cases (outages, overruns, onboarding) accept the org or any of its
-  keys.
-- Later pages on a detected case are duplicates, reported but not false.
+  Org-level cases (outages, overruns, leaks, onboarding, growth) accept the org
+  or any of its keys. Cases spanning several orgs (provider outages, bad
+  deploys, chance clumps, renamed errors) accept any member org or key, or a
+  page naming nothing. `logsim/kinds.py` holds the table.
+- Later pages on a detected case are duplicates, reported but not false. The
+  report gives pages per detected case by kind: a provider outage paged once
+  per org is a provider outage paged several times over.
 - Any other page in the scored phase is false. One that lands on a must-stay-quiet
   case is charged to that kind; the rest are `unexplained` (named an entity)
   or `unattributed` (named none).
@@ -170,26 +211,35 @@ to recall: a system that never pages has none.
 signal, learned in warm-up and then frozen (`logsim/baseline.py` lists them).
 If it scored well, the pairs would be too easy.
 
-On the full `dev.toml` run with seed 1 (two scored weeks), it detected all 23
-must-alert cases, a 95% Wilson interval of 0.86 to 1.0, with a median of 0.84
-minutes to detect. It also sent 1,058 false pages, 529 a week, for a
-precision of 0.02:
+On the full `dev.toml` run with seed 1 (two scored weeks), scored with
+signals, it detected 34 of 37 must-alert cases, a 95% Wilson interval of 0.79
+to 0.97, with a median of 0.9 minutes to detect. It also sent 1,104 false
+pages, 552 a week, for a precision of 0.03:
 
 | Cause | False pages | What happened |
 |---|---|---|
-| `unexplained` | 717 | 716 are request-spike pages on the two onboarded orgs' keys after their ramp: with no warm-up history, the frozen floor fires every 30 minutes for the rest of the run |
-| `chance_error_clump` | 141 | it paged on 123 of 126 chance clumps |
-| `onboarding` | 122 | the same keys during their ramp |
-| `maintenance_window` | 78 | it paged on all 77 maintenance windows |
+| `unexplained` | 736 | 733 are request-spike pages on the two onboarded orgs' keys after their ramp: with no warm-up history, the frozen floor fires every 30 minutes for the rest of the run |
+| `onboarding` | 127 | the same keys during their ramp |
+| `chance_error_clump` | 120 | it paged on 122 of 126 chance clumps |
+| `maintenance_window` | 74 | it paged on all 77 maintenance windows |
+| `batch_surge` | 24 | it paged on 13 of 135 daily batches |
+| `retry_echo` | 20 | it paged on 19 of 116 echoes |
+| `renamed_error` | 3 | it paged on 2 of 3 renamed messages |
 
-It never paged on a natural burst (0 of 277) or a scheduled export (0 of 14):
-per-key history is enough for those pairs. The outage and error pairs and new
-customers are where a threshold fails, and where a system has to show it can do
-better.
+It missed 3 of the 4 `error_rate_shift` cases: a 5xx count frozen at its
+warm-up maximum cannot tell a rising error share from a busy hour. It caught
+both latency leaks, 14 and 21 hours in, about 40% of the way through each, then
+paged on them every 30 minutes until the restart: 48.5 pages per detected
+leak. It never paged on a natural burst (0 of 277), a scheduled export (0 of
+14) or organic growth (0 of 2).
 
-A false page is charged to a quiet case by entity and time, not by what the
-page says: 16 of the baseline's request-spike pages are charged to chance
-clumps because the key they named was in one.
+Without signals it scores almost the same (34 detected, 1,099 false), because
+its false pages mostly land where no alert case is running. A system whose
+noise falls inside a long case would gain detections it did not make.
+
+A false page is charged to a quiet case by entity, time and signal, not by
+what the page says: a request-spike page on a key in a chance clump would be
+charged to the clump if it carried `errors`.
 
 ## Reproducibility
 
@@ -214,9 +264,9 @@ operator until scoring is done. `.gitignore` excludes `out/`, `private/` and
 ## Volume
 
 Measured with `configs/dev.toml` (`rate_scale = 0.1`) and seed 1 over the full
-21 days: 19.2 million records, 0.92 million a day, 7.4 GB as JSONL. On an
-Apple-silicon laptop, generating it took 2.6 minutes, the baseline 52 seconds,
-and scoring 0.2 seconds.
+21 days: 21.7 million records, 1.03 million a day, 7.8 GB as JSONL. On an
+Apple-silicon laptop that was also running the test suite, generating it took
+3.1 minutes, the baseline 63 seconds, and scoring 0.3 seconds.
 
 `traffic.rate_scale` multiplies every request rate, bursts included, and keeps
 their ratios. Lower rates also mean sparser counts per minute, which changes
@@ -229,7 +279,5 @@ how noisy a key looks, so scale down knowingly.
 - **The agent arm.** A fresh agent with a fixed prompt and read-only queries
   against the same logs is planned as a comparison arm; neither the prompt nor
   its harness exists.
-- **Self-exciting bursts.** Retry storms, where one failure triggers more, are
-  not modelled.
 - **Delivery parity.** Nothing checks that every system received every record
   beyond the Collector's own exporter logs.

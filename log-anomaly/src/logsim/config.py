@@ -52,6 +52,7 @@ class Traffic:
     diurnal_amplitude: float
     diurnal_peak_hour: float
     weekend_factor: float
+    server_error_share: float  # requests answered 500
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,35 @@ class Exports:
 
 
 @dataclass(frozen=True)
+class Retries:
+    min_rate_per_second: float  # after rate_scale
+    blip_seconds: Range
+    echoes_per_key_per_day: float
+    echo_branching: Range
+    echo_delay_seconds: float
+    storm_branching: Range
+    storm_delay_seconds: float
+    storm_max_rate_per_second: float  # before rate_scale
+    storm_minutes: Range
+
+
+@dataclass(frozen=True)
+class Batches:
+    share: float
+    local_hour: Range
+    duration_minutes: Range
+    multiplier: Range
+    jitter_minutes: float
+
+
+@dataclass(frozen=True)
+class Deploys:
+    timezone: str
+    local_hour: Range
+    per_weekday: float
+
+
+@dataclass(frozen=True)
 class Health:
     interval_seconds: int
     latency_ms_median: float
@@ -119,6 +149,12 @@ class BackgroundError:
 
 
 @dataclass(frozen=True)
+class Rename:
+    template: int  # index into Config.background_errors
+    to: MessageTemplate
+
+
+@dataclass(frozen=True)
 class Scenarios:
     burst_on_steady_key: int
     unplanned_outage: int
@@ -127,6 +163,13 @@ class Scenarios:
     unscheduled_bulk_export: int
     key_silence: int
     onboarding: int
+    retry_storm: int
+    error_rate_shift: int
+    provider_outage: int
+    bad_deploy: int
+    renamed_error: int
+    latency_leak: int
+    organic_growth: int
     min_gap_hours: float
     outage_minutes: Range
     outage_local_hour: Range
@@ -137,6 +180,14 @@ class Scenarios:
     silence_local_hour: Range
     silence_min_rate_per_second: float
     onboarding_ramp_days: float
+    error_shift_min_rate_per_second: float
+    provider_outage_minutes: Range
+    bad_deploy_minutes: Range
+    bad_deploy_error_share: Range
+    leak_hours: Range
+    leak_factor: Range
+    growth_days: Range
+    growth_factor: Range
 
 
 @dataclass(frozen=True)
@@ -150,9 +201,13 @@ class Config:
     archetypes: dict[str, KeyArchetype]
     bursts: Bursts
     exports: Exports
+    retries: Retries
+    batches: Batches
+    deploys: Deploys
     health: Health
     background_errors: tuple[BackgroundError, ...]
     novel_errors: tuple[MessageTemplate, ...]
+    renames: tuple[Rename, ...]
     scenarios: Scenarios
 
 
@@ -256,6 +311,7 @@ def load(path: Path) -> Config:
         diurnal_amplitude=traffic_t.number("diurnal_amplitude", low=0.0, high=0.99),
         diurnal_peak_hour=traffic_t.number("diurnal_peak_hour", low=0.0, high=24.0),
         weekend_factor=traffic_t.number("weekend_factor", low=0.0),
+        server_error_share=traffic_t.number("server_error_share", low=0.0, high=0.5),
     )
     traffic_t.close()
 
@@ -296,6 +352,39 @@ def load(path: Path) -> Config:
     )
     exports_t.close()
 
+    retries_t = root.table("retries")
+    retries = Retries(
+        min_rate_per_second=retries_t.number("min_rate_per_second", low=0.0),
+        blip_seconds=retries_t.range("blip_seconds", low=1.0),
+        echoes_per_key_per_day=retries_t.number("echoes_per_key_per_day", low=0.0),
+        # Below 1 a cascade dies out on its own; at or above 1 it does not.
+        echo_branching=retries_t.range("echo_branching", low=0.0, high=0.99),
+        echo_delay_seconds=retries_t.number("echo_delay_seconds", low=0.1),
+        storm_branching=retries_t.range("storm_branching", low=1.01),
+        storm_delay_seconds=retries_t.number("storm_delay_seconds", low=0.1),
+        storm_max_rate_per_second=retries_t.number("storm_max_rate_per_second", low=1.0),
+        storm_minutes=retries_t.range("storm_minutes", low=1.0),
+    )
+    retries_t.close()
+
+    batches_t = root.table("batches")
+    batches = Batches(
+        share=batches_t.number("share", low=0.0, high=1.0),
+        local_hour=batches_t.range("local_hour", low=0.0, high=24.0),
+        duration_minutes=batches_t.range("duration_minutes", low=1.0),
+        multiplier=batches_t.range("multiplier", low=1.0),
+        jitter_minutes=batches_t.number("jitter_minutes", low=0.0),
+    )
+    batches_t.close()
+
+    deploys_t = root.table("deploys")
+    deploys = Deploys(
+        timezone=_timezone(deploys_t.text("timezone"), "deploys.timezone"),
+        local_hour=deploys_t.range("local_hour", low=0.0, high=24.0),
+        per_weekday=deploys_t.number("per_weekday", low=0.0),
+    )
+    deploys_t.close()
+
     health_t = root.table("health")
     health = Health(
         interval_seconds=health_t.integer("interval_seconds", low=1),
@@ -313,8 +402,20 @@ def load(path: Path) -> Config:
     for t in errors_t.tables("novel"):
         novel.append(_template(t))
         t.close()
+    renames = []
+    originals = [b.template.text for b in background]
+    for t in errors_t.tables("renames"):
+        original = t.text("from")
+        if original not in originals:
+            raise ConfigError(f"errors.renames: {original!r} is not an errors.background template")
+        index = originals.index(original)
+        old = background[index].template
+        renames.append(Rename(index, _template_text(t.text("to"), old.service, old.severity)))
+        t.close()
     errors_t.close()
-    texts = [b.template.text for b in background] + [n.text for n in novel]
+    if len({r.template for r in renames}) != len(renames):
+        raise ConfigError("errors.renames: each background template may be renamed once")
+    texts = originals + [n.text for n in novel] + [r.to.text for r in renames]
     if len(set(texts)) != len(texts):
         raise ConfigError("errors: every template text must be unique, or a novel error is not novel")
 
@@ -323,6 +424,11 @@ def load(path: Path) -> Config:
         raise ConfigError(
             f"scenarios.novel_error: {scenarios.novel_error} scenarios need as many errors.novel "
             f"templates, found {len(novel)}; each template is used once so it stays novel"
+        )
+    if scenarios.renamed_error > len(renames):
+        raise ConfigError(
+            f"scenarios.renamed_error: {scenarios.renamed_error} scenarios need as many errors.renames, "
+            f"found {len(renames)}"
         )
 
     root.close()
@@ -336,9 +442,13 @@ def load(path: Path) -> Config:
         archetypes=archetypes,
         bursts=bursts,
         exports=exports,
+        retries=retries,
+        batches=batches,
+        deploys=deploys,
         health=health,
         background_errors=tuple(background),
         novel_errors=tuple(novel),
+        renames=tuple(renames),
         scenarios=scenarios,
     )
 
@@ -403,7 +513,13 @@ def _orgs(t: _Table) -> Orgs:
 
 
 def _template(t: _Table) -> MessageTemplate:
-    text = t.text("template")
+    severity = t.text("severity")
+    if severity not in SEVERITIES:
+        raise ConfigError(f"error template {t.text('template')!r}: severity must be one of {SEVERITIES}")
+    return _template_text(t.text("template"), t.text("service"), severity)
+
+
+def _template_text(text: str, service: str, severity: str) -> MessageTemplate:
     try:
         fields = {name for _, name, _, _ in string.Formatter().parse(text) if name is not None}
     except ValueError as exc:
@@ -412,10 +528,7 @@ def _template(t: _Table) -> MessageTemplate:
         raise ConfigError(
             f"error template {text!r}: fields {sorted(fields - TEMPLATE_FIELDS)} not in {sorted(TEMPLATE_FIELDS)}"
         )
-    severity = t.text("severity")
-    if severity not in SEVERITIES:
-        raise ConfigError(f"error template {text!r}: severity must be one of {SEVERITIES}")
-    return MessageTemplate(service=t.text("service"), severity=severity, text=text)
+    return MessageTemplate(service=service, severity=severity, text=text)
 
 
 def _scenarios(t: _Table) -> Scenarios:
@@ -427,6 +540,13 @@ def _scenarios(t: _Table) -> Scenarios:
         unscheduled_bulk_export=t.integer("unscheduled_bulk_export", low=0),
         key_silence=t.integer("key_silence", low=0),
         onboarding=t.integer("onboarding", low=0),
+        retry_storm=t.integer("retry_storm", low=0),
+        error_rate_shift=t.integer("error_rate_shift", low=0),
+        provider_outage=t.integer("provider_outage", low=0),
+        bad_deploy=t.integer("bad_deploy", low=0),
+        renamed_error=t.integer("renamed_error", low=0),
+        latency_leak=t.integer("latency_leak", low=0),
+        organic_growth=t.integer("organic_growth", low=0),
         min_gap_hours=t.number("min_gap_hours", low=0.0),
         outage_minutes=t.range("outage_minutes", low=0.0),
         outage_local_hour=t.range("outage_local_hour", low=0.0, high=24.0),
@@ -437,6 +557,14 @@ def _scenarios(t: _Table) -> Scenarios:
         silence_local_hour=t.range("silence_local_hour", low=0.0, high=24.0),
         silence_min_rate_per_second=t.number("silence_min_rate_per_second", low=0.0),
         onboarding_ramp_days=t.number("onboarding_ramp_days", low=0.0),
+        error_shift_min_rate_per_second=t.number("error_shift_min_rate_per_second", low=0.0),
+        provider_outage_minutes=t.range("provider_outage_minutes", low=0.0),
+        bad_deploy_minutes=t.range("bad_deploy_minutes", low=1.0),
+        bad_deploy_error_share=t.range("bad_deploy_error_share", low=0.0, high=1.0),
+        leak_hours=t.range("leak_hours", low=1.0),
+        leak_factor=t.range("leak_factor", low=1.0),
+        growth_days=t.range("growth_days", low=0.0),
+        growth_factor=t.range("growth_factor", low=1.0),
     )
     t.close()
     return scenarios

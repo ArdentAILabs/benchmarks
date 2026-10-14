@@ -30,6 +30,10 @@ class Stream(IntEnum):
     ERRORS = 8
     NOVEL_ERRORS = 9
     ERROR_TEXT = 10
+    RETRIES = 11
+    RETRY_RECORDS = 12
+    DEPLOYS = 13
+    BATCHES = 14
 
 
 def rng(seed: int, stream: Stream, *parts: int) -> np.random.Generator:

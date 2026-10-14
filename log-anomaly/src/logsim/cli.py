@@ -15,8 +15,8 @@ from pathlib import Path
 
 from logsim import config, live
 from logsim.baseline import run_baseline
-from logsim.clumps import chance_error_clumps
 from logsim.generate import generate_chunk
+from logsim.labels import chance_error_clumps, renamed_errors
 from logsim.output import OtlpHttpSink, SinkError, iso, record_line, truth_line, world_document
 from logsim.plan import NS, Plan, PlanError, Truth, build_plan
 from logsim.repro import versions
@@ -87,7 +87,8 @@ def _load(args: argparse.Namespace) -> tuple[config.Config, World, Plan, tuple[T
     cfg = config.load(args.config)
     world = build_world(cfg, args.seed)
     plan = build_plan(cfg, world, args.seed, args.start)
-    truth = tuple(sorted(plan.truth + chance_error_clumps(cfg, world, plan, args.seed), key=lambda t: (t.start, t.id)))
+    labelled = chance_error_clumps(cfg, world, plan, args.seed) + renamed_errors(cfg, world, plan, args.seed)
+    truth = tuple(sorted(plan.truth + labelled, key=lambda t: (t.start, t.id)))
     identity = {
         "seed": args.seed,
         "config": args.config.name,

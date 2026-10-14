@@ -13,7 +13,7 @@ from conftest import SEED, START, run, variant
 from logsim.config import Config, load
 from logsim.generate import Record, generate_chunk
 from logsim.output import record_line
-from logsim.plan import MINUTE, NS, Burst, Plan, build_plan
+from logsim.plan import HOUR, MINUTE, NS, Burst, ErrorSpan, Plan, build_plan
 from logsim.world import World, build_world
 
 Run = tuple[World, Plan, list[Record]]
@@ -45,7 +45,7 @@ def test_output_is_pinned(cfg: Config, small_run: Run) -> None:
     for index in range(3):
         for record in generate_chunk(cfg, world, plan, SEED, index):
             digest.update((record_line(record) + "\n").encode())
-    assert digest.hexdigest() == "95b9d89926c3f9d518e94ac0a381138932b6db3432d565fdffbe78d50d2d7fcc"
+    assert digest.hexdigest() == "5ceec71f80741ec63eb8fa58e9a7f6d91160af940abaa50e401fa7325b1aa436"
 
 
 def test_records_are_time_ordered_and_inside_the_run(small_run: Run) -> None:
@@ -79,11 +79,13 @@ def test_silenced_keys_emit_nothing_in_their_window(small_run: Run) -> None:
 
 def test_health_fails_inside_outages_and_only_there(small_run: Run) -> None:
     world, plan, records = small_run
-    outage_kinds = ("maintenance_window", "maintenance_overrun", "unplanned_outage")
+    outage_kinds = ("maintenance_window", "maintenance_overrun", "unplanned_outage", "provider_outage")
     outages: dict[str, list[tuple[int, int]]] = {}
     for t in plan.truth:
         if t.kind in outage_kinds:
-            outages.setdefault(world.orgs[t.org].id, []).append((t.start, t.end))
+            for org in t.detail["orgs"] if t.org is None else [world.orgs[t.org].id]:
+                outages.setdefault(org, []).append((t.start, t.end))
+    assert any(t.kind == "provider_outage" for t in plan.truth)
     checked = Counter()
     for r in records:
         if r.service != "source-monitor":
@@ -146,6 +148,13 @@ def test_injection_leaves_no_structural_trace(tmp_path: Path, small_run: Run) ->
                 "unscheduled_bulk_export = 2": "unscheduled_bulk_export = 0",
                 "key_silence = 2": "key_silence = 0",
                 "onboarding = 1": "onboarding = 0",
+                "retry_storm = 2": "retry_storm = 0",
+                "error_rate_shift = 2": "error_rate_shift = 0",
+                "provider_outage = 1": "provider_outage = 0",
+                "bad_deploy = 1": "bad_deploy = 0",
+                "renamed_error = 1": "renamed_error = 0",
+                "latency_leak = 1": "latency_leak = 0",
+                "organic_growth = 1": "organic_growth = 0",
             },
         )
     )
@@ -228,3 +237,166 @@ def test_silence_holds_under_heavy_errors_and_exports(tmp_path: Path) -> None:
             r for r in records if r.attributes.get("api_key.id") == key_id and truth.start <= r.time < truth.end
         ] == []
         assert [r for r in records if r.attributes.get("api_key.id") == key_id and "http.route" not in r.attributes]
+
+
+def _hours(cfg: Config, world: World, plan: Plan, start: int, end: int) -> list[Record]:
+    first, last = (start - plan.start) // HOUR, (end - 1 - plan.start) // HOUR
+    return [r for i in range(first, min(last, plan.chunks - 1) + 1) for r in generate_chunk(cfg, world, plan, SEED, i)]
+
+
+def _status(records: list[Record]) -> Counter[int]:
+    return Counter(r.attributes["http.response.status_code"] for r in records)
+
+
+def _within(observed: int, expected: float) -> bool:
+    return abs(observed - expected) <= 5 * np.sqrt(expected) + 2
+
+
+def test_a_shift_raises_errors_and_leaves_volume_alone(cfg: Config, small_run: Run) -> None:
+    world, plan, _ = small_run
+    shifts = [t for t in plan.truth if t.kind == "error_rate_shift"]
+    assert shifts
+    for truth in shifts:
+        key = world.keys[truth.key]
+        spans = {
+            k: tuple(s for s in v if (s.start, s.end) != (truth.start, truth.end)) for k, v in plan.error_spans.items()
+        }
+        without = replace(plan, error_spans=spans)
+        shifted = _requests(_hours(cfg, world, plan, truth.start, truth.end), key.id, truth.start, truth.end)
+        plain = _requests(_hours(cfg, world, without, truth.start, truth.end), key.id, truth.start, truth.end)
+        # Same requests, to the nanosecond; only their outcomes moved.
+        assert [r.time for r in shifted] == [r.time for r in plain] and shifted
+        assert _within(_status(shifted)[500], len(shifted) * truth.detail["server_error_share"])
+        assert _status(shifted)[500] > _status(plain)[500]
+
+
+def test_a_batch_raises_volume_and_leaves_the_error_share_alone(cfg: Config, small_run: Run) -> None:
+    world, plan, _ = small_run
+    surges = [t for t in plan.truth if t.kind == "batch_surge" and t.scored][:4]
+    assert surges
+    for truth in surges:
+        key = world.keys[truth.key]
+        without = replace(plan, surges={k: () for k in plan.surges})
+        batch = _requests(_hours(cfg, world, plan, truth.start, truth.end), key.id, truth.start, truth.end)
+        plain = _requests(_hours(cfg, world, without, truth.start, truth.end), key.id, truth.start, truth.end)
+        assert plain and _within(len(batch), len(plain) * truth.detail["multiplier"])
+        assert _within(_status(batch)[500], len(batch) * cfg.traffic.server_error_share)
+
+
+def _cascade_case(plan: Plan, kind: str) -> tuple[object, object]:
+    truth = next(t for t in plan.truth if t.kind == kind and t.scored)
+    (cascade,) = [c for c in plan.cascades if (c.key, c.start) == (truth.key, truth.start)]
+    return truth, cascade
+
+
+@pytest.mark.parametrize("kind", ["retry_storm", "retry_echo"])
+def test_retries_fail_while_overloaded_and_succeed_after(cfg: Config, small_run: Run, kind: str) -> None:
+    """Every attempt in the cascade is emitted: during the overload every request
+    the key sends, original or retry, fails with 503; afterwards none does."""
+    world, plan, _ = small_run
+    truth, cascade = _cascade_case(plan, kind)
+    key = world.keys[truth.key]
+    others = tuple(c for c in plan.cascades if c is not cascade)
+    spans = {k: tuple(s for s in v if s.start != cascade.start) for k, v in plan.error_spans.items()}
+    without = replace(plan, cascades=others, error_spans=spans)
+    end = truth.end + 10 * MINUTE
+    emitted = _requests(_hours(cfg, world, plan, truth.start, end), key.id, truth.start, end)
+    plain = _requests(_hours(cfg, world, without, truth.start, end), key.id, truth.start, end)
+    assert len(emitted) == len(plain) + sum(cascade.attempts)
+    during = [r for r in emitted if r.time < cascade.overload_end]
+    after = [r for r in emitted if r.time >= cascade.overload_end]
+    assert during and set(_status(during)) == {503}
+    assert 503 not in _status(after)
+
+
+def test_a_leak_slows_its_org_in_proportion_and_stops_at_restart(cfg: Config, small_run: Run) -> None:
+    world, plan, _ = small_run
+    (truth,) = (t for t in plan.truth if t.kind == "latency_leak")
+    org = world.orgs[truth.org]
+    without = replace(plan, latency_ramps={})
+    late = truth.end - 2 * HOUR, truth.end + HOUR
+
+    def latencies(p: Plan) -> list[tuple[int, int]]:
+        records = _hours(cfg, world, p, *late)
+        return [
+            (r.time, r.attributes["duration_ms"])
+            for r in records
+            if r.attributes.get("org.id") == org.id and "http.route" in r.attributes
+        ]
+
+    leaking, plain = latencies(plan), latencies(without)
+    assert [t for t, _ in leaking] == [t for t, _ in plain] and leaking
+    for (t, ms), (_, base) in zip(leaking, plain, strict=True):
+        if t >= truth.end:
+            assert ms == base
+        else:
+            factor = 1 + (truth.detail["factor"] - 1) * (t - truth.start) / (truth.end - truth.start)
+            # Both sides are rounded to whole milliseconds.
+            assert abs(ms - base * factor) <= factor / 2 + 0.5, (ms, base, factor)
+
+
+def test_growth_raises_an_orgs_volume_and_keeps_it(cfg: Config, small_run: Run) -> None:
+    world, plan, _ = small_run
+    (truth,) = (t for t in plan.truth if t.kind == "organic_growth")
+    org = world.orgs[truth.org]
+    without = replace(plan, rate_ramps={})
+    after = truth.end, plan.end
+
+    def volume(p: Plan) -> int:
+        return sum(
+            1
+            for r in _hours(cfg, world, p, *after)
+            if r.attributes.get("org.id") == org.id and "http.route" in r.attributes and r.time >= truth.end
+        )
+
+    grown, plain = volume(plan), volume(without)
+    assert plain and _within(grown, plain * truth.detail["factor"])
+
+
+def test_a_bad_deploy_fails_its_providers_orgs_and_no_one_else(cfg: Config, small_run: Run) -> None:
+    world, plan, _ = small_run
+    (truth,) = (t for t in plan.truth if t.kind == "bad_deploy")
+    members = set(truth.detail["orgs"])
+    records = [r for r in _hours(cfg, world, plan, truth.start, truth.end) if truth.start <= r.time < truth.end]
+    hit = [r for r in records if "http.route" in r.attributes and r.attributes["org.id"] in members]
+    spared = [r for r in records if "http.route" in r.attributes and r.attributes["org.id"] not in members]
+    assert hit and spared
+    assert _within(_status(hit)[500], len(hit) * truth.detail["server_error_share"])
+    assert _within(_status(spared)[500], len(spared) * cfg.traffic.server_error_share)
+    deploys = [r for r in records if r.service == "deployer"]
+    assert deploys[0].time == truth.start and deploys[0].body == f"deployed release {truth.detail['release']}"
+
+
+def test_deploys_are_logged_once_each(small_run: Run) -> None:
+    _, plan, records = small_run
+    logged = [(r.time, r.attributes["deploy.release"]) for r in records if r.service == "deployer"]
+    assert logged == [(d.time, d.release) for d in plan.deploys] and logged
+
+
+def test_a_renamed_message_switches_text_at_its_deploy(cfg: Config, small_run: Run) -> None:
+    _, plan, records = small_run
+    (rename,) = plan.renames
+    old = cfg.background_errors[rename.template].template.text
+    patterns = {
+        text: re.compile(re.sub(r"\\\{(ms|id|n)\\\}", ".+", re.escape(text)) + "$") for text in (old, rename.to.text)
+    }
+    before = [r for r in records if r.time < rename.time]
+    after = [r for r in records if r.time >= rename.time]
+    assert [r for r in before if patterns[old].match(r.body)]
+    assert not [r for r in after if patterns[old].match(r.body)]
+    assert not [r for r in before if patterns[rename.to.text].match(r.body)]
+    assert [r for r in after if patterns[rename.to.text].match(r.body)]
+
+
+@pytest.mark.parametrize("overload_first", [True, False])
+def test_overlapping_failures_take_the_worse(cfg: Config, small_run: Run, overload_first: bool) -> None:
+    """An overloaded dependency fails every request, whatever else is failing some of them."""
+    world, plan, _ = small_run
+    key = next(k for k in world.keys if k.org not in plan.activations and k.org not in plan.rate_ramps)
+    start = plan.scored_from + 3 * HOUR
+    overload = ErrorSpan(key.index, start, start + HOUR, 1.0, 503)
+    partial = ErrorSpan(key.index, start, start + HOUR, 0.1, 500)
+    spans = (overload, partial) if overload_first else (partial, overload)
+    planted = replace(plan, error_spans={**plan.error_spans, key.index: spans})
+    requests = _requests(_hours(cfg, world, planted, start, start + HOUR), key.id, start, start + HOUR)
+    assert requests and set(_status(requests)) == {503}

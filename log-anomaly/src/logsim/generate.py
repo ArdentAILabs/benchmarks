@@ -8,16 +8,17 @@ produced it.
 
 from __future__ import annotations
 
+import bisect
 import math
-from datetime import UTC, datetime
+from collections.abc import Iterable
 from typing import NamedTuple
-from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from logsim.config import Config, MessageTemplate, Traffic
-from logsim.plan import HOUR, NS, Plan
+from logsim.config import Config, MessageTemplate
+from logsim.plan import HOUR, NS, OVERLOADED, SERVER_ERROR, Plan, Ramp
 from logsim.repro import Stream, rng, zone
+from logsim.traffic import profile
 from logsim.world import Key, Org, World
 
 Attribute = str | int | float
@@ -29,6 +30,8 @@ _ROUTES = (
     ("DELETE", "/v1/branches/{branch_id}", 204, 404, 0.05),
 )
 _ROUTE_P = np.array([r[4] for r in _ROUTES])
+_OK_STATUS = np.array([r[2] for r in _ROUTES])
+_CLIENT_STATUS = np.array([r[3] for r in _ROUTES])
 _CLIENT_ERROR_SHARE = 0.01
 _REQUEST_MS_MEDIAN = 80.0
 _REQUEST_MS_SIGMA = 0.5
@@ -54,6 +57,8 @@ def generate_chunk(cfg: Config, world: World, plan: Plan, seed: int, index: int)
     records: list[Record] = []
     for key in world.keys:
         records.extend(_requests(cfg, world.orgs[key.org], key, plan, seed, index, start))
+    records.extend(_retries(cfg, world, plan, seed, index, start, end))
+    records.extend(_deploys(plan, start, end))
     records.extend(_exports(world, plan, start, end))
     for org in world.orgs:
         records.extend(_health(cfg, org, plan, seed, index, start, end))
@@ -69,11 +74,14 @@ def _requests(cfg: Config, org: Org, key: Key, plan: Plan, seed: int, index: int
     instants = seconds * NS
     scale = cfg.traffic.rate_scale
 
-    rate = key.rate * scale * _profile(seconds, zone(org.timezone), cfg.traffic)
+    rate = key.rate * scale * profile(seconds, zone(org.timezone), cfg.traffic)
     if key.gamma_shape is not None:
         # Gamma-mixed Poisson per minute: a negative binomial count, overdispersed
         # with variance mean + mean^2 / shape.
         rate *= np.repeat(draw.gamma(key.gamma_shape, 1.0 / key.gamma_shape, 60), 60)
+    rate *= _ramp(plan.rate_ramps.get(key.org, ()), instants)
+    for surge in plan.surges.get(key.index, ()):
+        rate[(instants >= surge.start) & (instants < surge.end)] *= surge.multiplier
     activation = plan.activations.get(key.org)
     arrived = instants >= (activation.start if activation is not None else plan.start)
     if activation is not None:
@@ -91,22 +99,73 @@ def _requests(cfg: Config, org: Org, key: Key, plan: Plan, seed: int, index: int
     total = int(counts.sum())
     if total == 0:
         return []
-    times = np.repeat(instants, counts) + draw.integers(0, NS, total)
+    second = np.repeat(np.arange(3600), counts)
+    times = instants[second] + draw.integers(0, NS, total)
     routes = draw.choice(len(_ROUTES), size=total, p=_ROUTE_P)
-    rejected = draw.random(total) < _CLIENT_ERROR_SHARE
-    latency = np.rint(draw.lognormal(math.log(_REQUEST_MS_MEDIAN), _REQUEST_MS_SIGMA, total)).astype(np.int64)
+    outcome = draw.random(total)
+    latency = draw.lognormal(math.log(_REQUEST_MS_MEDIAN), _REQUEST_MS_SIGMA, total)
     request_ids = draw.integers(0, 1 << 63, total)
 
+    share = np.full(3600, cfg.traffic.server_error_share)
+    status = np.full(3600, SERVER_ERROR)
+    for span in plan.error_spans.get(key.index, ()):
+        inside = (instants >= span.start) & (instants < span.end) & (span.share >= share)
+        share[inside] = span.share
+        status[inside] = span.status
+    server = outcome < share[second]
+    rejected = ~server & (outcome < share[second] + _CLIENT_ERROR_SHARE)
+    codes = np.where(server, status[second], np.where(rejected, _CLIENT_STATUS[routes], _OK_STATUS[routes]))
+    latency *= _ramp(plan.latency_ramps.get(key.org, ()), times)
+    return _render(org, key, times, routes, codes, latency, request_ids)
+
+
+def _retries(cfg: Config, world: World, plan: Plan, seed: int, index: int, start: int, end: int) -> list[Record]:
+    """Retries are requests like any other: same routes, attributes and bodies.
+    They fail with 503 while their dependency is overloaded and succeed after."""
+    records: list[Record] = []
+    for number, cascade in enumerate(plan.cascades):
+        last = cascade.start + len(cascade.attempts) * NS
+        if cascade.start >= end or last <= start:
+            continue
+        key = world.keys[cascade.key]
+        first = cascade.start // NS
+        offsets = np.arange(len(cascade.attempts))
+        instants = (first + offsets) * NS
+        inside = (instants >= start) & (instants < end)
+        counts = np.asarray(cascade.attempts)[inside]
+        total = int(counts.sum())
+        if total == 0:
+            continue
+        draw = rng(seed, Stream.RETRY_RECORDS, number, index)
+        times = np.repeat(instants[inside], counts) + draw.integers(0, NS, total)
+        routes = draw.choice(len(_ROUTES), size=total, p=_ROUTE_P)
+        latency = draw.lognormal(math.log(_REQUEST_MS_MEDIAN), _REQUEST_MS_SIGMA, total)
+        request_ids = draw.integers(0, 1 << 63, total)
+        codes = np.where(times < cascade.overload_end, OVERLOADED, _OK_STATUS[routes])
+        latency *= _ramp(plan.latency_ramps.get(key.org, ()), times)
+        records.extend(_render(world.orgs[key.org], key, times, routes, codes, latency, request_ids))
+    return records
+
+
+def _render(
+    org: Org,
+    key: Key,
+    times: np.ndarray,
+    routes: np.ndarray,
+    codes: np.ndarray,
+    latency: np.ndarray,
+    request_ids: np.ndarray,
+) -> list[Record]:
     records = []
-    for t, r, bad, ms, rid in zip(
-        times.tolist(), routes.tolist(), rejected.tolist(), latency.tolist(), request_ids.tolist(), strict=True
+    milliseconds = np.rint(latency).astype(np.int64)
+    for t, r, status, ms, rid in zip(
+        times.tolist(), routes.tolist(), codes.tolist(), milliseconds.tolist(), request_ids.tolist(), strict=True
     ):
-        method, route, ok, client_error, _ = _ROUTES[r]
-        status = client_error if bad else ok
+        method, route = _ROUTES[r][:2]
         records.append(
             Record(
                 t,
-                "WARN" if bad else "INFO",
+                "ERROR" if status >= 500 else "WARN" if status >= 400 else "INFO",
                 "api",
                 f"{method} {route} {status}",
                 {
@@ -124,25 +183,23 @@ def _requests(cfg: Config, org: Org, key: Key, plan: Plan, seed: int, index: int
     return records
 
 
-def _profile(seconds: np.ndarray, tz: ZoneInfo, traffic: Traffic) -> np.ndarray:
-    """Relative request rate by org-local time: a daily cosine and a weekend dip."""
-    offset = _utc_offset(tz, int(seconds[0]))
-    if _utc_offset(tz, int(seconds[-1])) != offset:
-        raise ValueError(
-            f"{tz.key} changes UTC offset inside the hour at {int(seconds[0])}; chunks must not straddle one"
-        )
-    local = seconds + offset
-    hour = (local % 86400) / 3600.0
-    daily = 1.0 + traffic.diurnal_amplitude * np.cos(2.0 * np.pi * (hour - traffic.diurnal_peak_hour) / 24.0)
-    weekday = (local // 86400 + 3) % 7  # 1970-01-01 was a Thursday; Monday = 0
-    return daily * np.where(weekday >= 5, traffic.weekend_factor, 1.0)
+def _ramp(ramps: Iterable[Ramp], times: np.ndarray) -> np.ndarray:
+    """The product of every ramp's multiplier at each time."""
+    factor = np.ones(len(times))
+    for ramp in ramps:
+        progress = np.clip((times - ramp.start) / (ramp.end - ramp.start), 0.0, 1.0)
+        rising = 1.0 + (ramp.factor - 1.0) * progress
+        live = times >= ramp.start if ramp.holds else (times >= ramp.start) & (times < ramp.end)
+        factor *= np.where(live, rising, 1.0)
+    return factor
 
 
-def _utc_offset(tz: ZoneInfo, second: int) -> int:
-    delta = datetime.fromtimestamp(second, UTC).astimezone(tz).utcoffset()
-    if delta is None:
-        raise ValueError(f"{tz.key} has no UTC offset")
-    return int(delta.total_seconds())
+def _deploys(plan: Plan, start: int, end: int) -> list[Record]:
+    return [
+        Record(d.time, "INFO", "deployer", f"deployed release {d.release}", {"deploy.release": d.release})
+        for d in plan.deploys
+        if start <= d.time < end
+    ]
 
 
 def _exports(world: World, plan: Plan, start: int, end: int) -> list[Record]:
@@ -226,13 +283,21 @@ def background_errors(cfg: Config, world: World, plan: Plan, seed: int, index: i
     return events
 
 
+def background_text(cfg: Config, plan: Plan, template: int, t: int) -> MessageTemplate:
+    """The text a background error is logged with at `t`: its configured
+    template, or what a deploy before `t` renamed it to."""
+    renamed = [r for r in plan.renames if r.template == template]
+    position = bisect.bisect_right([r.time for r in renamed], t)
+    return renamed[position - 1].to if position else cfg.background_errors[template].template
+
+
 def _errors(cfg: Config, world: World, plan: Plan, seed: int, index: int, start: int, end: int) -> list[Record]:
     records = []
     events = background_errors(cfg, world, plan, seed, index)
     if events:
         text = rng(seed, Stream.ERROR_TEXT, index)
         for t, template, key in events:
-            records.append(_error(world, world.keys[key], cfg.background_errors[template].template, t, text))
+            records.append(_error(world, world.keys[key], background_text(cfg, plan, template, t), t, text))
     novel = [n for n in plan.novel_errors if start <= n.time < end]
     if novel:
         draw = rng(seed, Stream.NOVEL_ERRORS, index)

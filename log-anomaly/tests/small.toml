@@ -10,6 +10,7 @@ rate_scale = 0.05
 diurnal_amplitude = 0.6    # peak is 1.6x, trough 0.4x the daily mean
 diurnal_peak_hour = 14.0   # org-local
 weekend_factor = 0.4
+server_error_share = 0.005   # requests answered 500
 
 # Orgs on a provider with a maintenance block go down for a few minutes every
 # day. Windows scheduled in local time move an hour in UTC when that zone
@@ -88,6 +89,38 @@ scheduled_bytes_median = 2.0e10
 scheduled_bytes_log_sigma = 0.2
 scheduled_local_hour = [1, 4]      # org-local
 scheduled_jitter_minutes = 10.0
+
+# A dependency fails for a few seconds and the key's clients retry. Each failed
+# attempt spawns `branching` retries on average after an exponential delay.
+# Clients that back off (echo, branching below 1) give up on their own; clients
+# that do not (storm, branching above 1) multiply the load until the admission
+# limit, and keep failing until a circuit breaker opens.
+[retries]
+min_rate_per_second = 0.05   # after rate_scale; keys this busy or busier have cascades
+blip_seconds = [20.0, 60.0]       # echo and storm both start with one
+echoes_per_key_per_day = 0.5
+echo_branching = [0.5, 0.9]
+echo_delay_seconds = 5.0
+storm_branching = [1.3, 2.0]
+storm_delay_seconds = 1.0
+storm_max_rate_per_second = 200.0  # before rate_scale
+storm_minutes = [5.0, 15.0]
+
+# Some keys run a batch job every day at about the same local time, which
+# multiplies their request rate, errors included. error_rate_shift draws its
+# duration and multiplier from here.
+[batches]
+share = 0.3
+local_hour = [8.0, 20.0]          # org-local
+duration_minutes = [30.0, 90.0]
+multiplier = [4.0, 8.0]
+jitter_minutes = 15.0
+
+# Releases of the whole fleet, logged by the `deployer` service. Weekdays only.
+[deploys]
+timezone = "America/Los_Angeles"
+local_hour = [9.0, 17.0]
+per_weekday = 8.0
 
 [health]
 interval_seconds = 30
@@ -177,6 +210,25 @@ service = "api"
 severity = "ERROR"
 template = "unexpected EOF reading source catalog after {ms}ms"
 
+# A deploy may rename a background message without changing how often it is
+# logged. The new text has never been seen, like a novel error, but nothing is
+# wrong. Each scenarios.renamed_error uses one of these.
+[[errors.renames]]
+from = "upstream timeout after {ms}ms"
+to = "upstream request timed out after {ms} ms"
+
+[[errors.renames]]
+from = "rate limit exceeded for key, retry after {n}s"
+to = "429: key over quota, retry in {n}s"
+
+[[errors.renames]]
+from = "slow query on branch {id}: {ms}ms"
+to = "query on branch {id} exceeded the slow threshold ({ms}ms)"
+
+[[errors.renames]]
+from = "connection pool exhausted after {ms}ms wait"
+to = "pool: no connection available within {ms}ms"
+
 # How many of each injected case the scored phase holds. README.md, "Scenarios",
 # gives the eligibility rule for each kind.
 [scenarios]
@@ -187,6 +239,13 @@ novel_error = 2
 unscheduled_bulk_export = 2
 key_silence = 2
 onboarding = 1
+retry_storm = 2
+error_rate_shift = 2
+provider_outage = 1
+bad_deploy = 1
+renamed_error = 1
+latency_leak = 1
+organic_growth = 1
 min_gap_hours = 2.0               # between scenarios in the same org
 outage_minutes = [5.0, 10.0]      # same spread as maintenance windows
 outage_local_hour = [2.0, 5.0]    # org-local, the hours maintenance happens in
@@ -197,3 +256,11 @@ silence_hours = 2.0
 silence_local_hour = [10.0, 14.0]  # org-local, weekdays only
 silence_min_rate_per_second = 0.02
 onboarding_ramp_days = 1.0
+error_shift_min_rate_per_second = 0.05  # after rate_scale
+provider_outage_minutes = [10.0, 30.0]
+bad_deploy_minutes = [20.0, 60.0]   # until the fix deploys
+bad_deploy_error_share = [0.05, 0.2]
+leak_hours = [12.0, 24.0]           # latency climbs until the process restarts
+leak_factor = [3.0, 6.0]
+growth_days = [0.5, 1.0]            # traffic climbs, then stays
+growth_factor = [1.5, 2.5]

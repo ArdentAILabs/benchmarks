@@ -2,11 +2,16 @@
 
 Input is the pages that reached a person, one JSON object per line:
 `time` (RFC 3339 with an offset) and, where the page names one, `api_key.id`
-and/or `org.id`. Every page is classified exactly once:
+and/or `org.id`. A page may also say what it saw, as `signal` (one of
+`logsim.kinds.SIGNAL_NAMES`); then it matches only cases showing that signal.
+Either every page in a file has a signal or none does, so two systems are never
+scored by different rules without it showing. Every page is classified exactly
+once:
 
 - true: names the entity of a must-alert case and arrives between the case's
   start and `deadline` after its end. The first such page detects the case.
-- duplicate: would be true, but the case was already detected.
+- duplicate: would be true, but the case was already detected. Reported per
+  detected case, since one incident paging thirty times is its own failure.
 - false: everything else in the scored phase. A false page that lands on a
   must-stay-quiet case is charged to that case's kind; one that names an
   entity but matches nothing is `unexplained`; one that names nothing is
@@ -29,25 +34,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from logsim.kinds import SCOPE, SIGNAL_NAMES, SIGNALS
 from logsim.plan import HOUR, MINUTE, NS
 
 WEEK = 7 * 24 * HOUR
-
-# Which entity a page must name to match a case of each kind. "members" cases
-# are fleet-wide and match a page naming any key or org involved, or none.
-SCOPE = {
-    "burst_on_steady_key": "key",
-    "natural_burst": "key",
-    "key_silence": "key",
-    "novel_error": "key",
-    "unscheduled_bulk_export": "key",
-    "scheduled_export": "key",
-    "unplanned_outage": "org",
-    "maintenance_overrun": "org",
-    "maintenance_window": "org",
-    "onboarding": "org",
-    "chance_error_clump": "members",
-}
 
 _TIME = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)$")
 
@@ -76,6 +66,7 @@ class Page:
     time: int
     org: str | None  # resolved from the key when the page names only a key
     key: str | None
+    signal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,13 +93,22 @@ class Run:
 class Report:
     deadline_minutes: float
     observed_weeks: float
+    signals: bool  # pages were matched on signal as well as entity and time
     pages: Counter[str] = field(default_factory=Counter)
     false_by_cause: Counter[str] = field(default_factory=Counter)
     detected: dict[str, int] = field(default_factory=dict)  # case id -> ns from start to first page
+    case_pages: Counter[str] = field(default_factory=Counter)  # detected case id -> true and duplicate pages
     must_alert: list[Case] = field(default_factory=list)
     must_stay_quiet: list[Case] = field(default_factory=list)
     paged_quiet: set[str] = field(default_factory=set)
     false_pages: list[dict[str, object]] = field(default_factory=list)
+
+    def _detected_by_kind(self) -> dict[str, list[str]]:
+        by_kind: dict[str, list[str]] = {}
+        for case in self.must_alert:
+            if case.id in self.detected:
+                by_kind.setdefault(case.kind, []).append(case.id)
+        return by_kind
 
     def as_dict(self) -> dict[str, object]:
         detected = len(self.detected)
@@ -117,6 +117,7 @@ class Report:
         ttd = sorted(self.detected.values())
         return {
             "deadline_minutes": self.deadline_minutes,
+            "matched_on": "entity, time and signal" if self.signals else "entity and time",
             "observed_weeks": round(self.observed_weeks, 3),
             "pages": dict(sorted(self.pages.items())),
             "false_pages_per_week": round(false / self.observed_weeks, 2) if self.observed_weeks else None,
@@ -141,6 +142,10 @@ class Report:
                     "cases": sum(c.kind == kind for c in self.must_stay_quiet),
                 }
                 for kind in sorted({c.kind for c in self.must_stay_quiet})
+            },
+            "pages_per_detected_case": {
+                kind: round(sum(self.case_pages[i] for i in ids) / len(ids), 2)
+                for kind, ids in sorted(self._detected_by_kind().items())
             },
             "minutes_to_detect": (
                 {"median": round(ttd[len(ttd) // 2] / MINUTE, 2), "max": round(ttd[-1] / MINUTE, 2)} if ttd else None
@@ -186,6 +191,8 @@ def load_run(directory: Path, allow_unfinished: bool = False) -> Run:
         if doc["kind"] not in SCOPE:
             raise ScoreError(f"truth.jsonl:{number}: no matching rule for kind {doc['kind']!r}")
         detail = doc["detail"]
+        if SCOPE[doc["kind"]] == "members" and "orgs" not in detail:
+            raise ScoreError(f"truth.jsonl:{number}: {doc['kind']} case lists no member orgs")
         cases.append(
             Case(
                 id=doc["id"],
@@ -258,17 +265,22 @@ def load_pages(path: Path, run: Run) -> list[Page]:
         key, org = doc.get("api_key.id"), doc.get("org.id")
         # An id the world does not know is a typo or a mapping bug in whatever
         # produced the file; matching it silently would turn it into a false page.
+        signal = doc.get("signal")
+        if signal is not None and signal not in SIGNAL_NAMES:
+            raise ScoreError(f"{where}: unknown signal {signal!r}; expected one of {sorted(SIGNAL_NAMES)}")
         if key is not None and key not in run.key_org:
             raise ScoreError(f"{where}: unknown api_key.id {key!r}")
         if org is not None and org not in run.orgs:
             raise ScoreError(f"{where}: unknown org.id {org!r}")
         if key is not None and org is not None and run.key_org[key] != org:
             raise ScoreError(f"{where}: api_key.id {key!r} belongs to {run.key_org[key]!r}, not {org!r}")
-        pages.append(Page(number, time, org if org is not None else run.key_org.get(key) if key else None, key))
+        pages.append(Page(number, time, org if org is not None else run.key_org.get(key) if key else None, key, signal))
     return pages
 
 
 def _names(page: Page, case: Case) -> bool:
+    if page.signal is not None and page.signal not in SIGNALS[case.kind]:
+        return False
     scope = SCOPE[case.kind]
     if scope == "key":
         return page.key is not None and page.key == case.key
@@ -282,7 +294,10 @@ def _names(page: Page, case: Case) -> bool:
 def score(run: Run, pages: list[Page], deadline_minutes: float) -> Report:
     deadline = int(deadline_minutes * MINUTE)
     countable = {c.id for c in run.cases if c.scored and run.observed(c.start, c.end + deadline)}
-    report = Report(deadline_minutes, run.observed_scored_time() / WEEK)
+    signals = {p.signal is not None for p in pages}
+    if len(signals) > 1:
+        raise ScoreError("some pages carry a signal and some do not; label all of them or none")
+    report = Report(deadline_minutes, run.observed_scored_time() / WEEK, signals == {True})
     report.must_alert = [c for c in run.cases if c.id in countable and c.expect == "alert"]
     report.must_stay_quiet = [c for c in run.cases if c.id in countable and c.expect == "quiet"]
 
@@ -299,8 +314,10 @@ def score(run: Run, pages: list[Page], deadline_minutes: float) -> Report:
                 report.pages["excluded"] += 1
             elif fresh := [c for c in live if c.id not in report.detected]:
                 report.detected[fresh[0].id] = page.time - fresh[0].start
+                report.case_pages[fresh[0].id] += 1
                 report.pages["true"] += 1
             else:
+                report.case_pages[live[0].id] += 1
                 report.pages["duplicate"] += 1
             continue
         if hits and not quiet:
@@ -324,6 +341,7 @@ def render(summary: dict[str, object]) -> str:
     recall = summary["recall"]
     lines = [
         f"observed scored time: {summary['observed_weeks']} weeks; deadline {summary['deadline_minutes']} min",
+        f"pages matched on {summary['matched_on']}",
         f"pages: {sum(pages.values())} ({', '.join(f'{k} {v}' for k, v in pages.items())})",
         f"false pages per week: {summary['false_pages_per_week']}",
     ]
@@ -337,6 +355,9 @@ def render(summary: dict[str, object]) -> str:
     lines += [f"  {v['detected']:3d}/{v['cases']:<3d} {kind}" for kind, v in summary["recall_by_kind"].items()]
     lines.append("quiet cases that drew a page:")
     lines += [f"  {v['paged']:4d}/{v['cases']:<4d} {kind}" for kind, v in summary["quiet_cases_paged"].items()]
+    if summary["pages_per_detected_case"]:
+        lines.append("pages per detected case:")
+        lines += [f"  {v:7.2f}  {kind}" for kind, v in summary["pages_per_detected_case"].items()]
     if summary["minutes_to_detect"]:
         ttd = summary["minutes_to_detect"]
         lines.append(f"minutes to detect: median {ttd['median']}, max {ttd['max']}")
