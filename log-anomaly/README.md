@@ -2,9 +2,9 @@
 
 `logsim` simulates the logs of a multi-tenant API: orgs, their API keys, and the
 databases they connect. It labels every case that should alert and every case
-that should not. One seeded run can be written to files or streamed live, so two
-alerting systems can watch the same records and be scored against the same
-truth.
+that should not. One seeded run can be written to files or streamed live, so
+several alerting systems can watch the same records, and `logsim score` grades
+each one's pages against the same truth.
 
 ## Why matched pairs
 
@@ -22,7 +22,13 @@ the entity's own history, or the metadata on its records, says which is which.
 | a source fails health checks for 5–10 min | the org's provider does daily maintenance at that hour (`maintenance_window`) | the provider does no maintenance (`unplanned_outage`) |
 | a maintenance window | it opens an hour later in UTC because the provider's zone left summer time | it runs 30–60 min instead of 5–10 (`maintenance_overrun`) |
 | a key exports ~20 GB at night | the key does this every week (`scheduled_export`) | the key never has (`unscheduled_bulk_export`) |
-| a handful of errors in ten minutes | a known error that clumps by chance (computed by a scorer, below) | an error message never seen before (`novel_error`) |
+| a handful of errors in ten minutes | a known error that clumps by chance (`chance_error_clump`) | an error message never seen before (`novel_error`) |
+
+Chance clumps are found after the fact: every run of at least
+`novel_error_count` lines of one background message within
+`novel_error_window_minutes` becomes one quiet case, overlapping runs merged.
+They are fleet-wide, so they name their keys and orgs in `detail` instead of
+one entity.
 
 Two cases stand alone: `key_silence` (a busy key goes quiet for two weekday
 hours, must alert) and `onboarding` (a new org appears and ramps up over days,
@@ -75,6 +81,10 @@ uv run pytest
 uv run logsim generate --config configs/dev.toml --seed 1 \
   --start 2026-10-19T00:00:00Z --hours 24 --out out/dev
 
+# Score a system's pages against a run, and produce the threshold baseline's pages.
+uv run logsim baseline --run out/dev --out out/dev/baseline.jsonl
+uv run logsim score --run out/dev --pages out/dev/baseline.jsonl --json out/dev/report.json
+
 # Emit a run in real time. Truth, world, manifest and journal go to --private-dir.
 uv run logsim stream --config configs/dev.toml --seed 1 \
   --start 2026-10-19T00:00:00Z --endpoint http://127.0.0.1:4318 \
@@ -105,7 +115,7 @@ vendor yet.
 | File | Contents |
 |---|---|
 | `logs.jsonl` | one record per line: `time` (RFC 3339, ns), `time_unix_nano`, `severity`, `service`, `body`, `attributes` |
-| `truth.jsonl` | one case per line: `id`, `kind`, `pair`, `expect` (`alert` or `quiet`), `scored`, `org.id`, `api_key.id`, `start`, `end`, `detail` |
+| `truth.jsonl` | one case per line: `id`, `kind`, `pair`, `expect` (`alert` or `quiet`), `scored`, `org.id`, `api_key.id`, `start`, `end`, `detail`; fleet-wide cases have neither id and list `keys` and `orgs` in `detail` |
 | `world.json` | every org and key with its archetype, rate, provider and schedule |
 | `manifest.json` | seed, config digest, run window, package versions; `generate` adds record counts and the log digest |
 | `journal.jsonl` | `stream` only: each start, minute-by-minute progress, and where it stopped |
@@ -119,6 +129,67 @@ request and health-check bodies as one without.
 
 Over a live stream the journal's gaps, from a `stopped` entry's
 `sent_through` to the next `emitting_from`, are time no detector saw.
+
+## Scoring
+
+A system under test is scored on the pages that reached a person, one JSON
+object per line:
+
+```json
+{"time": "2026-10-27T03:41:10Z", "api_key.id": "key_0123456789", "org.id": "org_0123456789"}
+```
+
+`time` is required, RFC 3339 with an offset. Name the key, the org, both, or
+neither, as the page did; other fields are ignored. An id the world does not
+know is an error, never a silent miss. Turning a vendor's incidents or issues
+into this file is the one step outside `logsim`.
+
+Every page is classified once. The rules live in `logsim/score.py`'s module
+docstring; in short:
+
+- A page detects a must-alert case when it names the case's entity and arrives
+  between the case's start and 15 minutes (`--deadline-minutes`) after its
+  end. Key-level cases need the key; naming only its org is not enough.
+  Org-level cases (outages, overruns, onboarding) accept the org or any of its
+  keys.
+- Later pages on a detected case are duplicates, reported but not false.
+- Any other page in the scored phase is false. One that lands on a must-stay-quiet
+  case is charged to that kind; the rest are `unexplained` (named an entity)
+  or `unattributed` (named none).
+- Warm-up, stream gaps, and cases that ran past the last emitted record are
+  excluded, not counted either way.
+
+The report gives false pages per week by cause, precision, recall with a
+95% Wilson interval, recall by kind, the share of each quiet kind that drew a
+page, and minutes to detect. False pages per week only means something next
+to recall: a system that never pages has none.
+
+## Baseline
+
+`logsim baseline` is the control every system has to beat: one threshold per
+signal, learned in warm-up and then frozen (`logsim/baseline.py` lists them).
+If it scored well, the pairs would be too easy.
+
+On the full `dev.toml` run with seed 1 (two scored weeks), it detected all 23
+must-alert cases, a 95% Wilson interval of 0.86 to 1.0, with a median of 0.84
+minutes to detect. It also sent 1,058 false pages, 529 a week, for a
+precision of 0.02:
+
+| Cause | False pages | What happened |
+|---|---|---|
+| `unexplained` | 717 | 716 are request-spike pages on the two onboarded orgs' keys after their ramp: with no warm-up history, the frozen floor fires every 30 minutes for the rest of the run |
+| `chance_error_clump` | 141 | it paged on 123 of 126 chance clumps |
+| `onboarding` | 122 | the same keys during their ramp |
+| `maintenance_window` | 78 | it paged on all 77 maintenance windows |
+
+It never paged on a natural burst (0 of 277) or a scheduled export (0 of 14):
+per-key history is enough for those pairs. The outage and error pairs and new
+customers are where a threshold fails, and where a system has to show it can do
+better.
+
+A false page is charged to a quiet case by entity and time, not by what the
+page says: 16 of the baseline's request-spike pages are charged to chance
+clumps because the key they named was in one.
 
 ## Reproducibility
 
@@ -142,11 +213,10 @@ operator until scoring is done. `.gitignore` excludes `out/`, `private/` and
 
 ## Volume
 
-Measured with `configs/dev.toml` (`rate_scale = 0.1`), seed 1, over the first
-week (warm-up, so no injected cases): 6.2 million records, 0.89 million a day,
-about 384 bytes each as JSONL, so 0.34 GB a day and roughly 7 GB over the full
-21-day run. Generating that week to files took 52 seconds on an Apple-silicon
-laptop. The `api` service's records are 95% of the total.
+Measured with `configs/dev.toml` (`rate_scale = 0.1`) and seed 1 over the full
+21 days: 19.2 million records, 0.92 million a day, 7.4 GB as JSONL. On an
+Apple-silicon laptop, generating it took 2.6 minutes, the baseline 52 seconds,
+and scoring 0.2 seconds.
 
 `traffic.rate_scale` multiplies every request rate, bursts included, and keeps
 their ratios. Lower rates also mean sparser counts per minute, which changes
@@ -154,12 +224,12 @@ how noisy a key looks, so scale down knowingly.
 
 ## Not built yet
 
-- **Scoring.** No scorer exists. It would match each alert to a truth case by
-  entity and time, count alerts that match nothing as false positives, and
-  exclude journal gaps.
-- **Chance error clumps.** Background errors clump by chance, but no quiet
-  truth case labels a clump; the scorer would find them in `logs.jsonl`.
+- **Vendor adapters.** Nothing yet turns Better Stack incidents or Sazabi
+  issues into a pages file.
+- **The agent arm.** A fresh agent with a fixed prompt and read-only queries
+  against the same logs is planned as a comparison arm; neither the prompt nor
+  its harness exists.
 - **Self-exciting bursts.** Retry storms, where one failure triggers more, are
   not modelled.
-- **Delivery parity.** Nothing checks that both systems received every record
+- **Delivery parity.** Nothing checks that every system received every record
   beyond the Collector's own exporter logs.
