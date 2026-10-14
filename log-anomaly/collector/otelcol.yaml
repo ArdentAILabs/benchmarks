@@ -1,0 +1,37 @@
+# Fans one logsim stream out to both systems under test, so each receives the
+# same records. Credentials come from the environment; nothing secret belongs
+# in this file.
+#
+#   BETTERSTACK_INGESTING_HOST  the source's ingesting host, without a scheme
+#   BETTERSTACK_SOURCE_TOKEN    the source's token
+#   SAZABI_INTAKE_URL           the full intake URL from the log source's setup screen
+#
+# Each exporter queues and retries on its own. If one drops data the two
+# systems no longer saw the same run; check the Collector's own logs for
+# exporter failures before scoring.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlphttp/betterstack:
+    endpoint: https://${env:BETTERSTACK_INGESTING_HOST}
+    encoding: json
+    headers:
+      Authorization: Bearer ${env:BETTERSTACK_SOURCE_TOKEN}
+  otlphttp/sazabi:
+    # The URL carries the project key; Sazabi's Collector guide sends no headers.
+    endpoint: ${env:SAZABI_INTAKE_URL}
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/betterstack, otlphttp/sazabi]

@@ -1,0 +1,200 @@
+# Public development config. Tune and practise against this with any seed.
+# A scored run uses a private config with this schema and a private seed; see
+# README.md, "Public and private".
+
+[run]
+warmup_days = 7    # no injected scenarios; detectors learn the normal shape
+scored_days = 14
+
+[traffic]
+rate_scale = 0.1           # multiplies every request rate, bursts included
+diurnal_amplitude = 0.6    # peak is 1.6x, trough 0.4x the daily mean
+diurnal_peak_hour = 14.0   # org-local
+weekend_factor = 0.4
+
+# Orgs on a provider with a maintenance block go down for a few minutes every
+# day. Windows scheduled in local time move an hour in UTC when that zone
+# changes offset: provider-a's when Europe leaves summer time (2026-10-25),
+# provider-b's when the US does (2026-11-01). provider-c schedules in UTC and
+# never moves.
+[[providers]]
+name = "provider-a"
+weight = 0.2
+maintenance = { timezone = "Europe/Berlin", start_hour = [3, 5], duration_minutes = [5, 10], jitter_minutes = 2 }
+
+[[providers]]
+name = "provider-b"
+weight = 0.2
+maintenance = { timezone = "America/New_York", start_hour = [3, 5], duration_minutes = [5, 10], jitter_minutes = 2 }
+
+[[providers]]
+name = "provider-c"
+weight = 0.15
+maintenance = { timezone = "UTC", start_hour = [2, 4], duration_minutes = [5, 10], jitter_minutes = 2 }
+
+[[providers]]
+name = "provider-d"
+weight = 0.25
+
+[[providers]]
+name = "provider-e"
+weight = 0.2
+
+# How each API key uses the product. Rates are requests/s on an average
+# weekday, before rate_scale.
+[keys.steady]          # Poisson around the daily curve
+weight = 0.5
+rate_per_second = [0.2, 2.0]
+
+[keys.bursty]          # steady, plus bursts drawn from [bursts]
+weight = 0.2
+rate_per_second = [2.0, 10.0]
+bursts_per_day = 2.0
+
+[keys.overdispersed]   # gamma-mixed Poisson per minute (negative binomial)
+weight = 0.3
+rate_per_second = [0.5, 4.0]
+gamma_shape = [0.5, 3.0]   # lower is clumpier
+
+[orgs]
+count = 14
+keys_per_org = [1, 3]
+timezones = ["America/Los_Angeles", "America/New_York", "Europe/London", "Europe/Berlin", "Asia/Tokyo"]
+
+# Large orgs whose keys behave differently, so the org-wide total hides what
+# any single key is doing. Their steady keys are the burst_on_steady_key pool.
+[[orgs.fixed]]
+keys = ["bursty", "steady", "steady", "overdispersed"]
+
+[[orgs.fixed]]
+keys = ["bursty", "steady", "steady"]
+
+# Natural bursts on bursty keys and injected bursts on steady keys both draw
+# from this distribution.
+[bursts]
+rate_per_second_median = 1000.0
+rate_log_sigma = 0.3
+duration_seconds_median = 90.0
+duration_log_sigma = 0.5
+duration_seconds_max = 300.0
+
+[exports]
+part_bytes = 536870912
+part_interval_seconds = [5.0, 15.0]
+ad_hoc_per_day = 2.0
+ad_hoc_bytes_median = 5.0e7
+ad_hoc_bytes_log_sigma = 1.0
+scheduled_share = 0.15             # keys with a weekly bulk export
+scheduled_bytes_median = 2.0e10
+scheduled_bytes_log_sigma = 0.2
+scheduled_local_hour = [1, 4]      # org-local
+scheduled_jitter_minutes = 10.0
+
+[health]
+interval_seconds = 30
+latency_ms_median = 12.0
+latency_log_sigma = 0.4
+
+# Background errors arrive as a fleet-wide Poisson process per template, so
+# they clump by chance. Templates may use {ms}, {id} and {n}.
+[errors]
+
+[[errors.background]]
+service = "api"
+severity = "ERROR"
+template = "upstream timeout after {ms}ms"
+rate_per_hour = 2.0
+
+[[errors.background]]
+service = "api"
+severity = "ERROR"
+template = "branch {id} provisioning failed: storage quota exceeded"
+rate_per_hour = 0.5
+
+[[errors.background]]
+service = "api"
+severity = "WARN"
+template = "rate limit exceeded for key, retry after {n}s"
+rate_per_hour = 4.0
+
+[[errors.background]]
+service = "worker"
+severity = "ERROR"
+template = "replication lag {ms}ms exceeds budget on branch {id}"
+rate_per_hour = 1.0
+
+[[errors.background]]
+service = "worker"
+severity = "ERROR"
+template = "snapshot {id} upload retried {n} times"
+rate_per_hour = 1.5
+
+[[errors.background]]
+service = "api"
+severity = "ERROR"
+template = "connection pool exhausted after {ms}ms wait"
+rate_per_hour = 1.0
+
+[[errors.background]]
+service = "worker"
+severity = "WARN"
+template = "slow query on branch {id}: {ms}ms"
+rate_per_hour = 6.0
+
+[[errors.background]]
+service = "api"
+severity = "ERROR"
+template = "TLS handshake with source failed: certificate verify failed"
+rate_per_hour = 0.3
+
+# Never emitted except by a novel_error scenario, each at most once per run.
+[[errors.novel]]
+service = "worker"
+severity = "ERROR"
+template = "WAL segment checksum mismatch on branch {id}"
+
+[[errors.novel]]
+service = "api"
+severity = "ERROR"
+template = "permission denied for schema public on branch {id}"
+
+[[errors.novel]]
+service = "worker"
+severity = "ERROR"
+template = "logical decoding stalled: slot {id} inactive for {ms}ms"
+
+[[errors.novel]]
+service = "api"
+severity = "ERROR"
+template = "branch {id} restore aborted: manifest missing {n} files"
+
+[[errors.novel]]
+service = "worker"
+severity = "ERROR"
+template = "disk full writing branch {id} after {n} retries"
+
+[[errors.novel]]
+service = "api"
+severity = "ERROR"
+template = "unexpected EOF reading source catalog after {ms}ms"
+
+# How many of each injected case the scored phase holds. README.md, "Scenarios",
+# gives the eligibility rule for each kind.
+[scenarios]
+burst_on_steady_key = 4
+unplanned_outage = 4
+maintenance_overrun = 4
+novel_error = 4
+unscheduled_bulk_export = 4
+key_silence = 3
+onboarding = 2
+min_gap_hours = 6.0               # between scenarios in the same org
+outage_minutes = [5.0, 10.0]      # same spread as maintenance windows
+outage_local_hour = [2.0, 5.0]    # org-local, the hours maintenance happens in
+overrun_minutes = [30.0, 60.0]
+novel_error_count = 4
+novel_error_window_minutes = 10.0
+silence_hours = 2.0
+silence_local_hour = [10.0, 14.0]  # org-local, weekdays only
+silence_min_rate_per_second = 0.05  # after rate_scale; 3 requests a minute
+onboarding_ramp_days = 3.0
