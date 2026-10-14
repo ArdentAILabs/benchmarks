@@ -29,6 +29,7 @@ class Stream(IntEnum):
     HEALTH = 7
     ERRORS = 8
     NOVEL_ERRORS = 9
+    ERROR_TEXT = 10
 
 
 def rng(seed: int, stream: Stream, *parts: int) -> np.random.Generator:

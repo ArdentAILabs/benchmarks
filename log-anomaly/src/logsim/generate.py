@@ -199,25 +199,40 @@ def _health(cfg: Config, org: Org, plan: Plan, seed: int, index: int, start: int
     return records
 
 
-def _errors(cfg: Config, world: World, plan: Plan, seed: int, index: int, start: int, end: int) -> list[Record]:
-    records = []
+def background_errors(cfg: Config, world: World, plan: Plan, seed: int, index: int) -> list[tuple[int, int, int]]:
+    """One hour's background errors as (time, template index, key index).
+
+    Kept apart from rendering so the chance-clump labels and the records come
+    from the same draws."""
+    start = plan.start + index * HOUR
+    end = start + HOUR
     # A key that sends no requests this hour logs no errors either; an error
     # from a silenced key would give the silence away.
     silenced = {s.key for spans in plan.silences.values() for s in spans if s.start < end and s.end > start}
     active = [k for k in world.keys if plan.active(k.org, start) and k.index not in silenced]
+    if not cfg.background_errors or not active:
+        return []
     weights = np.array([k.rate for k in active])
-    if cfg.background_errors and active:
-        if weights.sum() <= 0:
-            raise ValueError("background errors need at least one active key with a positive rate")
-        draw = rng(seed, Stream.ERRORS, index)
-        p = weights / weights.sum()
-        for background in cfg.background_errors:
-            count = int(draw.poisson(background.rate_per_hour))
-            times = (start + draw.integers(0, HOUR, count)).tolist()
-            picks = draw.choice(len(active), size=count, p=p).tolist()
-            for t, pick in zip(times, picks, strict=True):
-                records.append(_error(world, active[pick], background.template, t, draw))
+    if weights.sum() <= 0:
+        raise ValueError("background errors need at least one active key with a positive rate")
+    draw = rng(seed, Stream.ERRORS, index)
+    p = weights / weights.sum()
+    events = []
+    for template, background in enumerate(cfg.background_errors):
+        count = int(draw.poisson(background.rate_per_hour))
+        times = (start + draw.integers(0, HOUR, count)).tolist()
+        picks = draw.choice(len(active), size=count, p=p).tolist()
+        events.extend((t, template, active[pick].index) for t, pick in zip(times, picks, strict=True))
+    return events
 
+
+def _errors(cfg: Config, world: World, plan: Plan, seed: int, index: int, start: int, end: int) -> list[Record]:
+    records = []
+    events = background_errors(cfg, world, plan, seed, index)
+    if events:
+        text = rng(seed, Stream.ERROR_TEXT, index)
+        for t, template, key in events:
+            records.append(_error(world, world.keys[key], cfg.background_errors[template].template, t, text))
     novel = [n for n in plan.novel_errors if start <= n.time < end]
     if novel:
         draw = rng(seed, Stream.NOVEL_ERRORS, index)

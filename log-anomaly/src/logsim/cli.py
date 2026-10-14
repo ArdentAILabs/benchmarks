@@ -12,9 +12,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from logsim import config, live
+from logsim.clumps import chance_error_clumps
 from logsim.generate import generate_chunk
 from logsim.output import OtlpHttpSink, SinkError, iso, record_line, truth_line, world_document
-from logsim.plan import NS, Plan, PlanError, build_plan
+from logsim.plan import NS, Plan, PlanError, Truth, build_plan
 from logsim.repro import versions
 from logsim.world import World, build_world
 
@@ -65,10 +66,11 @@ def _utc_hour(text: str) -> int:
     return int(moment.timestamp()) * NS
 
 
-def _load(args: argparse.Namespace) -> tuple[config.Config, World, Plan, dict[str, object]]:
+def _load(args: argparse.Namespace) -> tuple[config.Config, World, Plan, tuple[Truth, ...], dict[str, object]]:
     cfg = config.load(args.config)
     world = build_world(cfg, args.seed)
     plan = build_plan(cfg, world, args.seed, args.start)
+    truth = tuple(sorted(plan.truth + chance_error_clumps(cfg, world, plan, args.seed), key=lambda t: (t.start, t.id)))
     identity = {
         "seed": args.seed,
         "config": args.config.name,
@@ -78,21 +80,21 @@ def _load(args: argparse.Namespace) -> tuple[config.Config, World, Plan, dict[st
         "end": iso(plan.end),
         "versions": versions(),
     }
-    return cfg, world, plan, identity
+    return cfg, world, plan, truth, identity
 
 
-def _write_static(directory: Path, world: World, plan: Plan) -> None:
+def _write_static(directory: Path, world: World, truth: tuple[Truth, ...]) -> None:
     (directory / "world.json").write_text(json.dumps(world_document(world), indent=2) + "\n", encoding="utf-8")
     with (directory / "truth.jsonl").open("w", encoding="utf-8") as handle:
-        for truth in plan.truth:
-            handle.write(truth_line(truth, world) + "\n")
+        for case in truth:
+            handle.write(truth_line(case, world) + "\n")
 
 
 def _generate(args: argparse.Namespace) -> int:
-    cfg, world, plan, identity = _load(args)
+    cfg, world, plan, truth, identity = _load(args)
     chunks = plan.chunks if args.hours is None else min(max(args.hours, 0), plan.chunks)
     args.out.mkdir(parents=True, exist_ok=False)
-    _write_static(args.out, world, plan)
+    _write_static(args.out, world, truth)
     digest = hashlib.sha256()
     counts: Counter[str] = Counter()
     with (args.out / "logs.jsonl").open("w", encoding="utf-8") as handle:
@@ -109,12 +111,12 @@ def _generate(args: argparse.Namespace) -> int:
         "logs_sha256": digest.hexdigest(),
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    _summarise(plan, sum(counts.values()), chunks)
+    _summarise(plan, truth, sum(counts.values()), chunks)
     return 0
 
 
 def _stream(args: argparse.Namespace) -> int:
-    cfg, world, plan, identity = _load(args)
+    cfg, world, plan, truth, identity = _load(args)
     headers = {}
     for header in args.header:
         name, sep, value = header.partition("=")
@@ -130,9 +132,9 @@ def _stream(args: argparse.Namespace) -> int:
         if existing != identity:
             raise SystemExit(f"logsim: {args.private_dir} belongs to a different run; refusing to resume")
     else:
-        _write_static(args.private_dir, world, plan)
+        _write_static(args.private_dir, world, truth)
         manifest_path.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
-    _summarise(plan, None, plan.chunks)
+    _summarise(plan, truth, None, plan.chunks)
     # docker stop and systemd send SIGTERM; turning it into SystemExit lets the
     # stream journal where it stopped, so the gap before a restart is exact.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
@@ -140,8 +142,8 @@ def _stream(args: argparse.Namespace) -> int:
     return 0
 
 
-def _summarise(plan: Plan, records: int | None, hours: int) -> None:
-    scored = Counter(f"{t.expect:5} {t.kind}" for t in plan.truth if t.scored)
+def _summarise(plan: Plan, truth: tuple[Truth, ...], records: int | None, hours: int) -> None:
+    scored = Counter(f"{t.expect:5} {t.kind}" for t in truth if t.scored)
     print(f"run {iso(plan.start)} .. {iso(plan.end)}, scored from {iso(plan.scored_from)}")
     if records is not None:
         print(f"{records} records over {hours} hours")

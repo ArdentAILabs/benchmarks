@@ -45,7 +45,7 @@ def test_output_is_pinned(cfg: Config, small_run: Run) -> None:
     for index in range(3):
         for record in generate_chunk(cfg, world, plan, SEED, index):
             digest.update((record_line(record) + "\n").encode())
-    assert digest.hexdigest() == "b66772d079efa63d3dcd6d3b195495b0d52140839eac245b8d54e1c6f1310b8f"
+    assert digest.hexdigest() == "95b9d89926c3f9d518e94ac0a381138932b6db3432d565fdffbe78d50d2d7fcc"
 
 
 def test_records_are_time_ordered_and_inside_the_run(small_run: Run) -> None:

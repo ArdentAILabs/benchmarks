@@ -41,7 +41,7 @@ def truth_line(truth: Truth, world: World) -> str:
             "pair": truth.pair,
             "expect": truth.expect,
             "scored": truth.scored,
-            "org.id": world.orgs[truth.org].id,
+            "org.id": None if truth.org is None else world.orgs[truth.org].id,
             "api_key.id": None if truth.key is None else world.keys[truth.key].id,
             "start": iso(truth.start),
             "end": iso(truth.end),

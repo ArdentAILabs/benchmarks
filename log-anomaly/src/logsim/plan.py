@@ -86,7 +86,7 @@ class Truth:
     kind: str
     pair: str  # matched-pair family the case belongs to
     expect: str  # "alert" or "quiet"
-    org: int
+    org: int | None  # None for fleet-wide cases, which list their entities in detail
     key: int | None
     start: int
     end: int
