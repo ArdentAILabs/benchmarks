@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from logsim.cli import main
 from logsim.config import Config, load
 from logsim.generate import Record, generate_chunk
 from logsim.plan import NS, Plan, build_plan
@@ -43,3 +44,22 @@ def cfg() -> Config:
 @pytest.fixture(scope="session")
 def small_run(cfg: Config) -> tuple[World, Plan, list[Record]]:
     return run(cfg)
+
+
+@pytest.fixture(scope="session")
+def run_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The small run written by `logsim generate`, every hour of it."""
+    out = tmp_path_factory.mktemp("run") / "small"
+    args = [
+        "generate",
+        "--config",
+        str(SMALL),
+        "--seed",
+        str(SEED),
+        "--start",
+        "2026-10-23T00:00:00Z",
+        "--out",
+        str(out),
+    ]
+    assert main(args) == 0
+    return out

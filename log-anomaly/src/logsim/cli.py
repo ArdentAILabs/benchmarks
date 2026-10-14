@@ -1,4 +1,6 @@
-"""Command line: `logsim generate` writes a run to files, `logsim stream` emits it live."""
+"""Command line: `generate` writes a run to files, `stream` emits one live, `score`
+grades a system's pages against a run, and `baseline` produces the threshold
+control's pages."""
 
 from __future__ import annotations
 
@@ -12,11 +14,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from logsim import config, live
+from logsim.baseline import run_baseline
 from logsim.clumps import chance_error_clumps
 from logsim.generate import generate_chunk
 from logsim.output import OtlpHttpSink, SinkError, iso, record_line, truth_line, world_document
 from logsim.plan import NS, Plan, PlanError, Truth, build_plan
 from logsim.repro import versions
+from logsim.score import ScoreError, load_pages, load_run, render, score
 from logsim.world import World, build_world
 
 
@@ -48,10 +52,23 @@ def main(argv: list[str] | None = None) -> int:
     stream.add_argument("--header", action="append", default=[], metavar="NAME=VALUE")
     stream.set_defaults(handler=_stream)
 
+    scorer = commands.add_parser("score", help="score one system's pages against a run's truth")
+    scorer.add_argument("--run", type=Path, required=True, help="a generate --out or stream --private-dir")
+    scorer.add_argument("--pages", type=Path, required=True, help="JSONL, one page per line; see README")
+    scorer.add_argument("--deadline-minutes", type=float, default=15.0)
+    scorer.add_argument("--allow-unfinished", action="store_true", help="score a stream that has not finished")
+    scorer.add_argument("--json", type=Path, help="also write the full report here")
+    scorer.set_defaults(handler=_score)
+
+    baseline = commands.add_parser("baseline", help="run the threshold baseline over a generated run")
+    baseline.add_argument("--run", type=Path, required=True, help="a generate --out holding logs.jsonl")
+    baseline.add_argument("--out", type=Path, required=True, help="pages JSONL to write; must not exist")
+    baseline.set_defaults(handler=_baseline)
+
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (config.ConfigError, PlanError, SinkError, live.FellBehind, FileExistsError) as exc:
+    except (config.ConfigError, PlanError, SinkError, ScoreError, live.FellBehind, FileExistsError) as exc:
         print(f"logsim: {exc}", file=sys.stderr)
         return 2
 
@@ -139,6 +156,24 @@ def _stream(args: argparse.Namespace) -> int:
     # stream journal where it stopped, so the gap before a restart is exact.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     live.stream(cfg, world, plan, args.seed, OtlpHttpSink(args.endpoint, headers), args.private_dir / "journal.jsonl")
+    return 0
+
+
+def _score(args: argparse.Namespace) -> int:
+    run = load_run(args.run, allow_unfinished=args.allow_unfinished)
+    report = score(run, load_pages(args.pages, run), args.deadline_minutes).as_dict()
+    if args.json is not None:
+        args.json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(render(report))
+    return 0
+
+
+def _baseline(args: argparse.Namespace) -> int:
+    pages = run_baseline(args.run)
+    with args.out.open("x", encoding="utf-8") as handle:
+        for page in pages:
+            handle.write(json.dumps(page) + "\n")
+    print(f"{len(pages)} pages written to {args.out}")
     return 0
 
 
