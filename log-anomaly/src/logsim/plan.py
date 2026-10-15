@@ -440,6 +440,12 @@ class _Builder:
                 if self.start <= at < self.end:
                     self.natural_deploys.append(at)
 
+    def _in_deploy_hours(self, at: int) -> bool:
+        d = self.cfg.deploys
+        local = datetime.fromtimestamp(at // NS, zone(d.timezone))
+        second = local.hour * 3600 + local.minute * 60 + local.second
+        return local.weekday() < 5 and d.local_hour.low * 3600 <= second < d.local_hour.high * 3600
+
     # -- scenarios -------------------------------------------------------
 
     def _eligible_keys(self, predicate: Callable[[Key, Org], bool]) -> list[Key]:
@@ -500,11 +506,15 @@ class _Builder:
             if candidate is None:
                 continue
             orgs, key, start, end, commit = candidate
-            if start < self.scored_from or end > self.end or not all(self._free(o, start, end) for o in orgs):
+            # A dedicated org is never a target, but a provider-wide failure
+            # takes it down with the rest: it is a bystander, neither checked
+            # for room nor booked.
+            booked = [o for o in orgs if o not in self.dedicated]
+            if start < self.scored_from or end > self.end or not all(self._free(o, start, end) for o in booked):
                 continue
             if alert and self._clashes(kind, orgs, key, start, end):
                 continue
-            for org in orgs:
+            for org in booked:
                 self.occupied[org].append((start, end))
             commit()
             placed += 1
@@ -798,17 +808,23 @@ class _Builder:
 
         self._place("error_rate_shift", sc.error_rate_shift, len(keys), error_rate_shift)
 
-    def _provider_members(self) -> dict[str, list[Org]]:
-        members: dict[str, list[Org]] = defaultdict(list)
-        for org in self._eligible_orgs():
-            members[org.provider.name].append(org)
-        return members
+    def _provider_orgs(self) -> dict[str, list[Org]]:
+        """Every org on each provider, dedicated ones included. Sparing them
+        would leave one org healthy while the rest of its provider fails, which
+        marks it as a quiet case."""
+        orgs: dict[str, list[Org]] = defaultdict(list)
+        for org in self.world.orgs:
+            orgs[org.provider.name].append(org)
+        return orgs
+
+    def _members(self, orgs: list[Org], end: int) -> list[Org]:
+        """The orgs that exist at some point before `end`: an org still to
+        arrive has no records to fail."""
+        return [o for o in orgs if self._is_active(o.index, end - 1)]
 
     def _outage_providers(self) -> list[tuple[str, list[Org]]]:
-        # Dedicated orgs stay out of it even on the failing provider, so each
-        # still tests only the one thing it was set aside for.
-        members = self._provider_members()
-        return [(p, members[p]) for p in sorted(members) if len(members[p]) >= _PROVIDER_OUTAGE_MIN_ORGS]
+        orgs = self._provider_orgs()
+        return [(p, orgs[p]) for p in sorted(orgs) if len(orgs[p]) >= _PROVIDER_OUTAGE_MIN_ORGS]
 
     def _provider_outages(self) -> None:
         sc = self.cfg.scenarios
@@ -822,15 +838,18 @@ class _Builder:
             minutes = draw.uniform(sc.provider_outage_minutes.low, sc.provider_outage_minutes.high)
             begin = int(draw.integers(self.scored_from, self.end))
             end = begin + int(minutes * MINUTE)
+            members = self._members(orgs, end)
+            if len(members) < _PROVIDER_OUTAGE_MIN_ORGS:
+                return None
 
             def commit() -> None:
                 used.add(index)
-                for org in orgs:
+                for org in members:
                     self.outages[org.index].append(Outage(org.index, begin, end))
-                detail = {"provider": provider, "orgs": sorted(o.id for o in orgs)}
+                detail = {"provider": provider, "orgs": sorted(o.id for o in members)}
                 self.injected.append(_Pending("provider_outage", "outage", "alert", None, None, begin, end, detail))
 
-            return tuple(o.index for o in orgs), None, begin, end, commit
+            return tuple(o.index for o in members), None, begin, end, commit
 
         self._place("provider_outage", sc.provider_outage, len(providers), provider_outage)
 
@@ -841,31 +860,40 @@ class _Builder:
         sc = self.cfg.scenarios
         draw = rng(self.seed, Stream.SCENARIOS, 5)
         deploys = self._scored_deploys()
-        members = self._provider_members()
-        providers = [(p, members[p]) for p in sorted(members)]
+        by_provider = self._provider_orgs()
+        providers = [(p, by_provider[p]) for p in sorted(by_provider)]
+        used: set[int] = set()
 
         def bad_deploy() -> _Candidate | None:
             at = deploys[int(draw.integers(len(deploys)))]
-            provider, orgs = providers[int(draw.integers(len(providers)))]
+            index = _pick(draw, list(range(len(providers))), used, lambda i: i)
+            provider, orgs = providers[index]
             minutes = draw.uniform(sc.bad_deploy_minutes.low, sc.bad_deploy_minutes.high)
             share = float(draw.uniform(sc.bad_deploy_error_share.low, sc.bad_deploy_error_share.high))
             if at in self.deploys_used:
                 return None
             fix = at + int(minutes * MINUTE)
+            # The fix ships as one more forward deploy, so it must look like
+            # one. An evening deploy would announce that the last release broke.
+            if not self._in_deploy_hours(fix):
+                return None
+            members = self._members(orgs, fix)
+            if not members:
+                return None
 
             def commit() -> None:
-                # The fix ships as one more forward deploy. A rollback marker
-                # would name the bad release after the fact, and a detector
-                # paging on it would score a detection it never made.
+                # A rollback marker would name the bad release after the fact,
+                # and a detector paging on it would score a detection it never made.
+                used.add(index)
                 self.deploys_used.add(at)
                 self.fix_deploys.append(fix)
-                for org in orgs:
+                for org in members:
                     for key in org.keys:
                         self.error_spans[key].append(ErrorSpan(key, at, fix, share, SERVER_ERROR))
-                detail = {"provider": provider, "orgs": sorted(o.id for o in orgs), "server_error_share": share}
+                detail = {"provider": provider, "orgs": sorted(o.id for o in members), "server_error_share": share}
                 self.injected.append(_Pending("bad_deploy", "deploy", "alert", None, None, at, fix, detail))
 
-            return tuple(o.index for o in orgs), None, at, fix, commit
+            return tuple(o.index for o in members), None, at, fix, commit
 
         self._place("bad_deploy", sc.bad_deploy, len(deploys) and len(providers), bad_deploy)
 

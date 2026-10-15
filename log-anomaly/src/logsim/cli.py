@@ -1,12 +1,13 @@
 """Command line: `generate` writes a run to files, `stream` emits one live, `score`
-grades a system's pages against a run, and `baseline` produces the threshold
-control's pages."""
+grades a system's pages against a run, `baseline` produces the threshold
+control's pages, and `seed` draws a secret seed for a scored run."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import secrets
 import signal
 import sys
 from collections import Counter
@@ -22,6 +23,11 @@ from logsim.plan import NS, Plan, PlanError, Truth, build_plan
 from logsim.repro import versions
 from logsim.score import ScoreError, load_pages, load_run, render, score
 from logsim.world import World, build_world
+
+# A world takes about a millisecond to build, so anyone holding the config can
+# try every small seed and regenerate truth.jsonl. A live stream is the scored
+# path; it refuses a seed that could be found that way.
+MIN_STREAM_SEED = 2**64
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -64,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     baseline.add_argument("--run", type=Path, required=True, help="a generate --out holding logs.jsonl")
     baseline.add_argument("--out", type=Path, required=True, help="pages JSONL to write; must not exist")
     baseline.set_defaults(handler=_baseline)
+
+    seed = commands.add_parser("seed", help="print a random 128-bit seed for a scored run")
+    seed.set_defaults(handler=_seed)
 
     args = parser.parse_args(argv)
     try:
@@ -134,6 +143,10 @@ def _generate(args: argparse.Namespace) -> int:
 
 
 def _stream(args: argparse.Namespace) -> int:
+    if args.seed < MIN_STREAM_SEED:
+        raise SystemExit(
+            "logsim: stream needs a seed of at least 2**64 so it cannot be guessed; `logsim seed` prints one"
+        )
     cfg, world, plan, truth, identity = _load(args)
     headers = {}
     for header in args.header:
@@ -175,6 +188,11 @@ def _baseline(args: argparse.Namespace) -> int:
         for page in pages:
             handle.write(json.dumps(page) + "\n")
     print(f"{len(pages)} pages written to {args.out}")
+    return 0
+
+
+def _seed(args: argparse.Namespace) -> int:
+    print(secrets.randbits(127) + 2**127)
     return 0
 
 

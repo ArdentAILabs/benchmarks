@@ -10,7 +10,7 @@ from conftest import SEED, START, variant
 
 from logsim.config import Config, load
 from logsim.kinds import SCOPE, SIGNALS
-from logsim.plan import DAY, HOUR, MINUTE, NS, Plan, PlanError, Truth, _Builder, build_plan
+from logsim.plan import DAY, HOUR, MINUTE, NS, Activation, Plan, PlanError, Truth, _Builder, _wall, build_plan
 from logsim.repro import zone
 from logsim.world import World, build_world
 
@@ -65,11 +65,26 @@ def test_no_target_repeats_within_a_kind_while_others_remain(cfg: Config) -> Non
     assert max(targets.values()) == 1
 
 
+def test_bad_deploys_spread_over_providers(tmp_path: Path) -> None:
+    """The small run has one bad deploy, so the check above cannot see a repeat."""
+    cfg = load(variant(tmp_path, {"bad_deploy = 1": "bad_deploy = 3"}))
+    _, plan = _plan(cfg)
+    providers = [t.detail["provider"] for t in plan.truth if t.kind == "bad_deploy"]
+    assert len(providers) == 3 and len(set(providers)) == 3
+
+
 def test_scenarios_in_one_org_keep_their_distance(cfg: Config) -> None:
+    """Dedicated orgs aside: a provider-wide failure takes them down as
+    bystanders whenever it happens."""
     world, plan = _plan(cfg)
     gap = int(cfg.scenarios.min_gap_hours * HOUR)
+    dedicated = set(plan.activations) | set(plan.rate_ramps)
     by_org = sorted(
-        ((org, t.start, t.end, t.kind) for t in plan.truth if t.kind not in NATURAL for org in _orgs(world, t)),
+        (org, t.start, t.end, t.kind)
+        for t in plan.truth
+        if t.kind not in NATURAL
+        for org in _orgs(world, t)
+        if not (org in dedicated and t.kind in ("provider_outage", "bad_deploy"))
     )
     assert any(kind == "provider_outage" for *_, kind in by_org)
     for a, b in pairwise(by_org):
@@ -78,15 +93,20 @@ def test_scenarios_in_one_org_keep_their_distance(cfg: Config) -> None:
 
 
 def test_dedicated_orgs_are_excluded_from_other_scenarios(cfg: Config) -> None:
-    """Onboarding and organic growth each own their org: no alert case lands in
-    it, provider outages and bad deploys included."""
+    """Onboarding and organic growth each own their org: no other case targets
+    it. A provider-wide failure still takes it down with its provider."""
     world, plan = _plan(cfg)
     (newcomer,) = plan.activations
     (grower,) = plan.rate_ramps
+    provider_wide = {"provider_outage", "bad_deploy"}
     for org in (newcomer, grower):
-        assert {t.kind for t in plan.truth if t.expect == "alert" and org in _orgs(world, t)} == set()
-        keys = set(world.orgs[org].keys)
-        assert not keys & set(plan.error_spans) - {c.key for c in plan.cascades}
+        assert {t.kind for t in plan.truth if t.expect == "alert" and org in _orgs(world, t)} <= provider_wide
+        own = [t for t in plan.truth if t.org == org and t.kind not in NATURAL]
+        assert [t.kind for t in own] == ["onboarding" if org == newcomer else "organic_growth"]
+        spans = {(s.start, s.end) for k in world.orgs[org].keys for s in plan.error_spans.get(k, ())}
+        echoes = {(c.start, c.overload_end) for c in plan.cascades if world.keys[c.key].org == org}
+        bad = {(t.start, t.end) for t in plan.truth if t.kind == "bad_deploy" and org in _orgs(world, t)}
+        assert spans <= echoes | bad
     assert all(t.start >= plan.activations[newcomer].start for t in plan.truth if t.org == newcomer)
 
 
@@ -141,12 +161,15 @@ def test_too_many_scenarios_for_the_world_fails_loudly(tmp_path: Path) -> None:
         _plan(cfg)
 
 
-def test_provider_outage_takes_down_every_eligible_org_on_one_provider(cfg: Config) -> None:
+def test_provider_outage_takes_down_every_org_on_one_provider(cfg: Config) -> None:
     world, plan = _plan(cfg)
-    dedicated = set(plan.activations) | set(plan.rate_ramps)
     for truth in (t for t in plan.truth if t.kind == "provider_outage"):
         members = _orgs(world, truth)
-        expected = {o.index for o in world.orgs if o.provider.name == truth.detail["provider"]} - dedicated
+        expected = {
+            o.index
+            for o in world.orgs
+            if o.provider.name == truth.detail["provider"] and plan.active(o.index, truth.end - 1)
+        }
         assert members == expected and len(members) >= 2
         for org in members:
             assert any(o.start == truth.start and o.end == truth.end for o in plan.outages[org])
@@ -219,13 +242,34 @@ def test_alert_cases_keep_clear_of_quiet_look_alikes(cfg: Config) -> None:
 
 
 def test_deploys_ship_on_weekdays_in_working_hours(cfg: Config) -> None:
+    """Fixes included: one shipped at night would say the last release broke."""
     _, plan = _plan(cfg)
     tz = zone(cfg.deploys.timezone)
-    natural = [d for d in plan.deploys if d.time not in {t.end for t in plan.truth if t.kind == "bad_deploy"}]
-    assert natural
-    for deploy in natural:
+    assert any(t.kind == "bad_deploy" for t in plan.truth)
+    for deploy in plan.deploys:
         local = datetime.fromtimestamp(deploy.time // NS, tz)
         assert local.weekday() < 5 and cfg.deploys.local_hour.low <= local.hour < cfg.deploys.local_hour.high, local
+
+
+@pytest.mark.parametrize(("hour", "placed"), [(16.75, False), (15.0, True)])
+def test_a_fix_deploy_waits_for_working_hours(cfg: Config, hour: float, placed: bool) -> None:
+    """Direct, because few seeds draw a bad deploy late enough: from 16:45 the
+    fix (20-60 minutes later) would ship after 17:00, so it is never placed."""
+    world = build_world(cfg, SEED)
+    monday = int(datetime(2026, 10, 19, tzinfo=UTC).timestamp()) * NS
+    builder = _Builder(cfg, world, SEED, monday)
+    tz = zone(cfg.deploys.timezone)
+    day = datetime.fromtimestamp((builder.scored_from + DAY) // NS, tz).date()
+    assert day.weekday() < 5
+    # The run goes on well past that evening, so nothing else rules the fix out.
+    assert _wall(day, 20 * 3600, tz) < builder.end
+    builder.natural_deploys = [_wall(day, int(hour * 3600), tz)]
+    if placed:
+        builder._bad_deploys()
+        assert all(builder._in_deploy_hours(t) for t in builder.fix_deploys) and builder.fix_deploys
+    else:
+        with pytest.raises(PlanError, match="bad_deploy: placed 0 of"):
+            builder._bad_deploys()
 
 
 def test_clashes_follow_the_scorers_matching(cfg: Config) -> None:
@@ -249,23 +293,65 @@ def test_clashes_follow_the_scorers_matching(cfg: Config) -> None:
     assert not builder._clashes("bad_deploy", (key.org,), None, edge, edge + HOUR)
 
 
-def test_dedicated_orgs_are_no_providers_members(cfg: Config) -> None:
-    """Direct, because a seed may never put a dedicated org on the failing
-    provider: provider outages and bad deploys both draw members from here."""
+@pytest.mark.parametrize(
+    ("weekday", "hour", "inside"),
+    [(0, 9.0, True), (4, 16.99, True), (0, 8.99, False), (0, 17.0, False), (5, 12.0, False)],
+)
+def test_deploy_hours_are_weekday_working_hours(cfg: Config, weekday: int, hour: float, inside: bool) -> None:
     world = build_world(cfg, SEED)
     builder = _Builder(cfg, world, SEED, START)
-    org = world.orgs[0]
-    assert org in builder._provider_members()[org.provider.name]
-    builder.dedicated.add(org.index)
-    assert org not in builder._provider_members().get(org.provider.name, [])
+    tz = zone(cfg.deploys.timezone)
+    day = datetime.fromtimestamp(builder.scored_from // NS, tz).date()
+    day = day.fromordinal(day.toordinal() + (weekday - day.weekday()) % 7)
+    assert builder._in_deploy_hours(_wall(day, int(hour * 3600), tz)) is inside
 
 
-def test_a_provider_outage_needs_two_orgs(cfg: Config) -> None:
+def test_a_bad_deploy_needs_an_org_that_exists(cfg: Config) -> None:
+    world = build_world(cfg, SEED)
+    builder = _Builder(cfg, world, SEED, START)
+    builder._deploys()
+    for org in world.orgs:
+        builder.activations[org.index] = Activation(builder.end, builder.end + DAY)
+    with pytest.raises(PlanError, match="bad_deploy: placed 0 of"):
+        builder._bad_deploys()
+
+
+def test_dedicated_orgs_fail_with_their_provider_as_bystanders(cfg: Config) -> None:
+    """Direct, because a seed may never put a dedicated org on the failing
+    provider. Sparing it would mark it as a quiet case; it fails with the rest,
+    and placement neither needs room in it nor books any."""
     world = build_world(cfg, SEED)
     builder = _Builder(cfg, world, SEED, START)
     name, orgs = builder._outage_providers()[0]
-    builder.dedicated.update(o.index for o in orgs[1:])
-    assert name not in {p for p, _ in builder._outage_providers()}
+    bystander = orgs[0]
+    builder.dedicated.add(bystander.index)
+    builder.occupied[bystander.index].append((builder.scored_from, builder.end))
+    assert bystander in builder._provider_orgs()[name]
+    builder._provider_outages()
+    (outage,) = builder.injected
+    assert bystander.id in outage.detail["orgs"] and builder.outages[bystander.index]
+    assert builder.occupied[bystander.index] == [(builder.scored_from, builder.end)]
+
+
+def test_an_org_still_to_arrive_is_no_member(cfg: Config) -> None:
+    world = build_world(cfg, SEED)
+    builder = _Builder(cfg, world, SEED, START)
+    _, orgs = builder._outage_providers()[0]
+    hour = builder.scored_from + DAY
+    builder.activations[orgs[0].index] = Activation(hour + HOUR, hour + DAY)
+    assert orgs[0] not in builder._members(orgs, hour + HOUR)
+    assert orgs[0] in builder._members(orgs, hour + HOUR + 1)
+
+
+def test_a_provider_outage_needs_two_orgs(cfg: Config) -> None:
+    """With one org per provider existing for the whole run, none can fail."""
+    world = build_world(cfg, SEED)
+    builder = _Builder(cfg, world, SEED, START)
+    for _, orgs in builder._outage_providers():
+        for org in orgs[1:]:
+            builder.activations[org.index] = Activation(builder.end, builder.end + DAY)
+    with pytest.raises(PlanError, match="provider_outage: placed 0 of"):
+        builder._provider_outages()
 
 
 def test_a_storm_that_dies_out_is_never_placed(cfg: Config) -> None:

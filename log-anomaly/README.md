@@ -44,7 +44,9 @@ quiet).
 The plan keeps every must-alert case at least 30 minutes from any natural
 quiet case that shares its signal and its key (or, for a case on whole orgs,
 anything in them), so one page cannot be right about both.
-`test_alert_cases_keep_clear_of_quiet_look_alikes` checks it.
+`test_alert_cases_keep_clear_of_quiet_look_alikes` checks it. The one overlap
+allowed is a provider-wide failure taking down an onboarding or growing org
+(see "Scenarios"); a page there detects the failure.
 
 ## The world
 
@@ -72,7 +74,8 @@ one key does.
 Injected cases fall only in the scored phase, after `warmup_days` of normal
 traffic. Each kind picks a target that kind has not used yet while any remain,
 so no detector is graded on what it learned from an earlier injection on the
-same entity. Cases in one org are at least `min_gap_hours` apart. A schedule
+same entity. Cases in one org are at least `min_gap_hours` apart, except where
+a provider-wide failure takes down a bystander (below). A schedule
 that cannot be placed fails with the knob to change; it is never thinned.
 
 | Kind | Expect | Eligible targets |
@@ -85,16 +88,36 @@ that cannot be placed fails with the knob to change; it is never thinned.
 | `key_silence` | alert | non-bursty keys at or above `silence_min_rate_per_second` |
 | `retry_storm` | alert | keys at or above `retries.min_rate_per_second`; a cascade that dies out in its first seconds is drawn again |
 | `error_rate_shift` | alert | keys at or above `error_shift_min_rate_per_second`; duration and multiplier come from `[batches]` |
-| `provider_outage` | alert | providers with at least two eligible orgs; every eligible org on the provider fails |
-| `bad_deploy` | alert | a scored natural deploy; every eligible org on one provider fails at `bad_deploy_error_share` until a fix deploy |
+| `provider_outage` | alert | providers with at least two orgs that exist at the time; every one of them fails |
+| `bad_deploy` | alert | a scored natural deploy whose fix still ships in deploy hours; every org on one provider that exists at the time fails at `bad_deploy_error_share` until the fix |
 | `latency_leak` | alert | any eligible org |
 | `renamed_error` | quiet | a scored natural deploy no other scenario claimed; each `errors.renames` entry is used once |
-| `onboarding` | quiet | randomly drawn orgs, which then take part in no other scenario |
-| `organic_growth` | quiet | any org not onboarding, which then takes part in no other scenario |
+| `onboarding` | quiet | randomly drawn orgs, which no other scenario then targets |
+| `organic_growth` | quiet | any org not onboarding, which no other scenario then targets |
 
-"Eligible" orgs exclude the onboarding and organic-growth orgs, provider
-outages and bad deploys included, so each of those tests only the one thing it
-was set aside for.
+"Eligible" orgs exclude the onboarding and organic-growth orgs, so each of
+those tests only the one thing it was set aside for. A provider-wide failure
+is the exception: it takes them down with the rest of their provider, without
+needing room in their schedule. Sparing them would leave one org healthy while
+every other org on its provider failed, which marks it as a quiet case.
+
+Nothing in the timing gives a case away either. A bad deploy's fix ships as a
+forward deploy in the same weekday working hours as every other release; one
+shipped in the evening would announce that the release before it broke.
+`test_a_fix_deploy_waits_for_working_hours` checks it.
+
+### How many cases
+
+Recall over 72 must-alert cases at about 0.9 has a 95% Wilson interval about
+0.13 wide (0.19 at 37 cases), so two systems a few cases apart are not
+distinguishable by their intervals, and each
+kind's 4 to 8 cases rank kinds only roughly. Compare systems case by case on
+the same run, not by their intervals. `dev.toml` holds 72 must-alert cases in
+24 orgs. Across seeds 1 to 20 every schedule placed; 3 of the 20 reused a
+`burst_on_steady_key` target and 3 an `unplanned_outage` target, because a kind
+reuses targets once it runs out (see above). More cases
+need more orgs, and more orgs mean more records to pay a vendor for (see
+"Volume").
 
 ## Running
 
@@ -113,7 +136,9 @@ uv run logsim baseline --run out/dev --out out/dev/baseline.jsonl
 uv run logsim score --run out/dev --pages out/dev/baseline.jsonl --json out/dev/report.json
 
 # Emit a run in real time. Truth, world, manifest and journal go to --private-dir.
-uv run logsim stream --config configs/dev.toml --seed 1 \
+# A stream needs a seed nobody can guess; keep it to restart with.
+mkdir -p private && uv run logsim seed > private/seed
+uv run logsim stream --config configs/dev.toml --seed "$(cat private/seed)" \
   --start 2026-10-19T00:00:00Z --endpoint http://127.0.0.1:4318 \
   --private-dir private/dev
 ```
@@ -212,28 +237,30 @@ signal, learned in warm-up and then frozen (`logsim/baseline.py` lists them).
 If it scored well, the pairs would be too easy.
 
 On the full `dev.toml` run with seed 1 (two scored weeks), scored with
-signals, it detected 34 of 37 must-alert cases, a 95% Wilson interval of 0.79
-to 0.97, with a median of 0.9 minutes to detect. It also sent 1,104 false
-pages, 552 a week, for a precision of 0.03:
+signals, it detected 63 of 72 must-alert cases, a 95% Wilson interval of 0.78
+to 0.93, with a median of 0.9 minutes to detect. It also sent 1,338 false
+pages, 669 a week, for a precision of 0.045:
 
 | Cause | False pages | What happened |
 |---|---|---|
-| `unexplained` | 736 | 733 are request-spike pages on the two onboarded orgs' keys after their ramp: with no warm-up history, the frozen floor fires every 30 minutes for the rest of the run |
-| `onboarding` | 127 | the same keys during their ramp |
-| `chance_error_clump` | 120 | it paged on 122 of 126 chance clumps |
-| `maintenance_window` | 74 | it paged on all 77 maintenance windows |
-| `batch_surge` | 24 | it paged on 13 of 135 daily batches |
-| `retry_echo` | 20 | it paged on 19 of 116 echoes |
-| `renamed_error` | 3 | it paged on 2 of 3 renamed messages |
+| `unexplained` | 846 | 841 are pages on the two onboarded orgs' keys after their ramp, 801 of them request spikes: with no warm-up history, the frozen floor fires every 30 minutes for the rest of the run |
+| `onboarding` | 204 | the same keys during their ramp |
+| `maintenance_window` | 140 | it paged on all 143 maintenance windows |
+| `chance_error_clump` | 119 | it paged on 122 of 126 chance clumps |
+| `retry_echo` | 15 | it paged on 16 of 181 echoes |
+| `natural_burst` | 5 | it paged on 12 of 358 natural bursts |
+| `scheduled_export` | 4 | it paged on 4 of 32 weekly exports |
+| `renamed_error` | 3 | it paged on 2 of 4 renamed messages |
+| `batch_surge` | 2 | it paged on 2 of 165 daily batches |
 
-It missed 3 of the 4 `error_rate_shift` cases: a 5xx count frozen at its
-warm-up maximum cannot tell a rising error share from a busy hour. It caught
-both latency leaks, 14 and 21 hours in, about 40% of the way through each, then
-paged on them every 30 minutes until the restart: 48.5 pages per detected
-leak. It never paged on a natural burst (0 of 277), a scheduled export (0 of
-14) or organic growth (0 of 2).
+It missed all 8 `error_rate_shift` cases: a 5xx count frozen at its warm-up
+maximum cannot tell a rising error share from a busy hour. It missed the one
+bad deploy that broke a single org. It caught all four latency leaks, 14 to 28
+hours in, a third to a half of the way through each, then paged on them every
+30 minutes until the restart: 52.25 pages per detected leak. It never paged on
+organic growth (0 of 2).
 
-Without signals it scores almost the same (34 detected, 1,099 false), because
+Without signals it scores almost the same (63 detected, 1,326 false), because
 its false pages mostly land where no alert case is running. A system whose
 noise falls inside a long case would gain detections it did not make.
 
@@ -261,12 +288,21 @@ counts and rates) and a private seed. Its truth and world files stay with the
 operator until scoring is done. `.gitignore` excludes `out/`, `private/` and
 `*.private.toml`.
 
+The seed is the secret that matters. Everything a run contains follows from
+the config and the seed, a world takes about a millisecond to build, and every
+record names its org and key, so anyone holding the config can try small seeds
+until the ids match and regenerate `truth.jsonl`. With `dev.toml` and seed 1
+that takes one guess. `logsim seed` prints a random 128-bit seed, and `logsim
+stream` refuses any seed below 2^64 (`cli.MIN_STREAM_SEED`). `generate` takes
+any seed, for practice.
+
 ## Volume
 
-Measured with `configs/dev.toml` (`rate_scale = 0.1`) and seed 1 over the full
-21 days: 21.7 million records, 1.03 million a day, 7.8 GB as JSONL. On an
-Apple-silicon laptop that was also running the test suite, generating it took
-3.1 minutes, the baseline 63 seconds, and scoring 0.3 seconds.
+Measured with `configs/dev.toml` (24 orgs, `rate_scale = 0.1`) and seed 1 over
+the full 21 days: 31.8 million records, 1.5 million a day, 12.2 GB as JSONL.
+On an Apple-silicon laptop, generating it took 5.7 minutes, the baseline 1.9
+minutes, and scoring under a second. The 14-org config before it, with half
+the cases, wrote 7.8 GB.
 
 `traffic.rate_scale` multiplies every request rate, bursts included, and keeps
 their ratios. Lower rates also mean sparser counts per minute, which changes
